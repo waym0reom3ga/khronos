@@ -1,0 +1,9 @@
+[package]
+name = "khronos-db"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+khronos-core = { path = "../core" }
+rusqlite = { version = "0.35", features = ["bundled"] }
+serde_json = "1"
