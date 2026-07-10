@@ -3,15 +3,26 @@ name = "khronos-server"
 version = "0.1.0"
 edition = "2024"
 
+[[bin]]
+name = "khronos"
+path = "src/main.rs"
+
 [dependencies]
 khronos-core = { path = "../core" }
 khronos-db = { path = "../db" }
 tonic = "0.13"
 prost = "0.13"
+async-trait = "0.1"
 tokio = { version = "1", features = ["full"] }
 tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 clap = { version = "4", features = ["derive"] }
 futures = "0.3"
+uuid = { version = "1", features = ["v4"] }
+serde_json = "1"
+chrono = { version = "0.4", features = ["serde"] }
+cron = "0.15"
+rusqlite = { version = "0.35", features = ["bundled"] }
 
 [build-dependencies]
 tonic-build = "0.13"
