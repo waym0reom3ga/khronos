@@ -1,6 +1,6 @@
 //! Workflow CRUD operations.
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, NaiveDateTime, Utc};
 use khronos_core::{Timeouts, WorkflowInstance, WorkflowState};
 use rusqlite::{params, Connection, Row};
 
@@ -196,8 +196,27 @@ fn format_datetime(dt: Option<DateTime<Utc>>) -> Option<String> {
     dt.map(|d| d.format("%Y-%m-%d %H:%M:%S").to_string())
 }
 
-/// Parse an ISO 8601 datetime string into a DateTime<Utc>.
+/// Parse a datetime string (ISO 8601 or SQLite format) into DateTime<Utc>.
 fn parse_datetime(s: &str) -> Result<DateTime<Utc>, Box<dyn std::error::Error + Send + Sync>> {
-    let dt = chrono::DateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S")?;
-    Ok(dt.with_timezone(&Utc))
+    // Try naive formats first (no timezone info) — use NaiveDateTime then attach UTC
+    for fmt in [
+        "%Y-%m-%d %H:%M:%S%.f",   // SQLite with fractional seconds
+        "%Y-%m-%d %H:%M:%S",       // SQLite datetime('now') default
+        "%Y-%m-%dT%H:%M:%S%.f",    // ISO without timezone, with ms
+        "%Y-%m-%dT%H:%M:%S",       // ISO without timezone
+    ] {
+        if let Ok(naive) = NaiveDateTime::parse_from_str(s, fmt) {
+            return Ok(naive.and_utc());
+        }
+    }
+    // Try formats with explicit timezone info
+    for fmt in [
+        "%Y-%m-%dT%H:%M:%S%.fZ",   // Rust chrono default (ISO with ms + Z)
+        "%Y-%m-%dT%H:%M:%SZ",      // ISO without ms + Z
+    ] {
+        if let Ok(dt) = chrono::DateTime::parse_from_str(s, fmt) {
+            return Ok(dt.with_timezone(&Utc));
+        }
+    }
+    Err(format!("Failed to parse datetime: {}", s).into())
 }

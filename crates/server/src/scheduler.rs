@@ -3,7 +3,7 @@
 use std::str::FromStr;
 use std::time::Duration;
 
-use chrono::Utc;
+use chrono::{DateTime, NaiveDateTime, Utc};
 use khronos_db::Database;
 use tracing::{debug, info, warn};
 
@@ -137,8 +137,7 @@ impl Scheduler {
 
         match last_started {
             Some(ts_str) => {
-                let last: chrono::DateTime<Utc> = chrono::DateTime::parse_from_str(&ts_str, "%Y-%m-%d %H:%M:%S")?
-                    .with_timezone(&Utc);
+                let last = parse_datetime(&ts_str)?;
                 let elapsed = now.signed_duration_since(last).num_seconds();
                 Ok(elapsed >= interval_secs as i64)
             }
@@ -331,4 +330,29 @@ fn get_workflow_definition(name: &str) -> Vec<khronos_core::ActivityStep> {
             heartbeat_timeout_secs: Some(60),
         }],
     }
+}
+
+/// Parse a datetime string (ISO 8601 or SQLite format) into DateTime<Utc>.
+fn parse_datetime(s: &str) -> Result<DateTime<Utc>, Box<dyn std::error::Error + Send + Sync>> {
+    // Try naive formats first (no timezone info) — use NaiveDateTime then attach UTC
+    for fmt in [
+        "%Y-%m-%d %H:%M:%S%.f",   // SQLite with fractional seconds
+        "%Y-%m-%d %H:%M:%S",       // SQLite datetime('now') default
+        "%Y-%m-%dT%H:%M:%S%.f",    // ISO without timezone, with ms
+        "%Y-%m-%dT%H:%M:%S",       // ISO without timezone
+    ] {
+        if let Ok(naive) = NaiveDateTime::parse_from_str(s, fmt) {
+            return Ok(naive.and_utc());
+        }
+    }
+    // Try formats with explicit timezone info
+    for fmt in [
+        "%Y-%m-%dT%H:%M:%S%.fZ",   // Rust chrono default (ISO with ms + Z)
+        "%Y-%m-%dT%H:%M:%SZ",      // ISO without ms + Z
+    ] {
+        if let Ok(dt) = chrono::DateTime::parse_from_str(s, fmt) {
+            return Ok(dt.with_timezone(&Utc));
+        }
+    }
+    Err(format!("Failed to parse datetime: {}", s).into())
 }
