@@ -229,3 +229,197 @@ fn parse_datetime(s: &str) -> Result<DateTime<Utc>, Box<dyn std::error::Error + 
     }
     Err(format!("Failed to parse datetime: {}", s).into())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use khronos_core::{OverlapPolicy, ScheduleSpec, Timeouts};
+    use rusqlite::Connection;
+
+    fn test_conn() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::schema::migrate(&conn).unwrap();
+        conn
+    }
+
+    fn make_cron_schedule(id: &str) -> Schedule {
+        let now = Utc::now();
+        Schedule {
+            schedule_id: id.to_string(),
+            namespace: "default".to_string(),
+            spec: ScheduleSpec::Cron(vec!["0 * * * *".to_string()]),
+            action: WorkflowAction {
+                workflow_name: "test_wf".to_string(),
+                args: BTreeMap::new(),
+                task_queue: "default".to_string(),
+                id: "action-1".to_string(),
+                timeouts: Timeouts::default(),
+            },
+            policy: OverlapPolicy::Skip,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    fn make_interval_schedule(id: &str) -> Schedule {
+        let now = Utc::now();
+        Schedule {
+            schedule_id: id.to_string(),
+            namespace: "default".to_string(),
+            spec: ScheduleSpec::Interval(std::time::Duration::from_secs(300)),
+            action: WorkflowAction {
+                workflow_name: "interval_wf".to_string(),
+                args: BTreeMap::new(),
+                task_queue: "default".to_string(),
+                id: "action-2".to_string(),
+                timeouts: Timeouts::default(),
+            },
+            policy: OverlapPolicy::Buffer(5),
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    #[test]
+    fn test_insert_and_get_cron_schedule() {
+        let conn = test_conn();
+        let schedule = make_cron_schedule("cron-1");
+        insert_schedule(&conn, &schedule).unwrap();
+
+        let result = get_schedule(&conn, "cron-1").unwrap().expect("Schedule should exist");
+        assert_eq!(result.schedule_id, "cron-1");
+        assert_eq!(result.namespace, "default");
+        match result.spec {
+            ScheduleSpec::Cron(exprs) => {
+                assert_eq!(exprs.len(), 1);
+                assert_eq!(exprs[0], "0 * * * *");
+            }
+            _ => panic!("Expected Cron spec"),
+        }
+    }
+
+    #[test]
+    fn test_insert_and_get_interval_schedule() {
+        let conn = test_conn();
+        let schedule = make_interval_schedule("interval-1");
+        insert_schedule(&conn, &schedule).unwrap();
+
+        let result = get_schedule(&conn, "interval-1").unwrap().expect("Schedule should exist");
+        assert_eq!(result.schedule_id, "interval-1");
+        match result.spec {
+            ScheduleSpec::Interval(dur) => assert_eq!(dur.as_secs(), 300),
+            _ => panic!("Expected Interval spec"),
+        }
+    }
+
+    #[test]
+    fn test_get_nonexistent_schedule() {
+        let conn = test_conn();
+        let result = get_schedule(&conn, "nonexistent").unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_list_schedules_empty() {
+        let conn = test_conn();
+        let schedules = list_schedules(&conn, "default").unwrap();
+        assert!(schedules.is_empty());
+    }
+
+    #[test]
+    fn test_list_schedules_multiple() {
+        let conn = test_conn();
+        insert_schedule(&conn, &make_cron_schedule("cron-1")).unwrap();
+        insert_schedule(&conn, &make_interval_schedule("interval-1")).unwrap();
+
+        let schedules = list_schedules(&conn, "default").unwrap();
+        assert_eq!(schedules.len(), 2);
+    }
+
+    #[test]
+    fn test_list_schedules_namespace_filter() {
+        let conn = test_conn();
+        insert_schedule(&conn, &make_cron_schedule("cron-1")).unwrap();
+
+        // Insert schedule in different namespace
+        let mut ns_schedule = make_interval_schedule("interval-ns");
+        ns_schedule.namespace = "other".to_string();
+        insert_schedule(&conn, &ns_schedule).unwrap();
+
+        assert_eq!(list_schedules(&conn, "default").unwrap().len(), 1);
+        assert_eq!(list_schedules(&conn, "other").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn test_update_schedule_spec() {
+        let conn = test_conn();
+        let schedule = make_cron_schedule("update-test");
+        insert_schedule(&conn, &schedule).unwrap();
+
+        // Update to interval spec
+        let mut updated = schedule.clone();
+        updated.spec = ScheduleSpec::Interval(std::time::Duration::from_secs(600));
+        update_schedule_spec(&conn, "update-test", "default", &updated).unwrap();
+
+        let result = get_schedule(&conn, "update-test").unwrap().expect("Schedule should exist");
+        match result.spec {
+            ScheduleSpec::Interval(dur) => assert_eq!(dur.as_secs(), 600),
+            _ => panic!("Expected Interval spec after update"),
+        }
+    }
+
+    #[test]
+    fn test_delete_schedule() {
+        let conn = test_conn();
+        insert_schedule(&conn, &make_cron_schedule("delete-test")).unwrap();
+
+        assert!(get_schedule(&conn, "delete-test").unwrap().is_some());
+
+        let rows = delete_schedule(&conn, "delete-test", "default").unwrap();
+        assert_eq!(rows, 1);
+
+        assert!(get_schedule(&conn, "delete-test").unwrap().is_none());
+    }
+
+    #[test]
+    fn test_delete_nonexistent_schedule() {
+        let conn = test_conn();
+        let rows = delete_schedule(&conn, "nonexistent", "default").unwrap();
+        assert_eq!(rows, 0);
+    }
+
+    #[test]
+    fn test_schedule_with_args_round_trip() {
+        let conn = test_conn();
+        let mut args = BTreeMap::new();
+        args.insert("key1".to_string(), "val1".to_string());
+        args.insert("key2".to_string(), "val2".to_string());
+
+        let schedule = Schedule {
+            schedule_id: "args-test".to_string(),
+            namespace: "default".to_string(),
+            spec: ScheduleSpec::Cron(vec!["*/5 * * * *".to_string()]),
+            action: WorkflowAction {
+                workflow_name: "wf_with_args".to_string(),
+                args: args.clone(),
+                task_queue: "workers".to_string(),
+                id: "action-args".to_string(),
+                timeouts: Timeouts {
+                    execution_timeout_secs: Some(3600),
+                    run_timeout_secs: None,
+                    task_timeout_secs: Some(300),
+                },
+            },
+            policy: OverlapPolicy::TerminateExisting,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+
+        insert_schedule(&conn, &schedule).unwrap();
+        let result = get_schedule(&conn, "args-test").unwrap().expect("Schedule should exist");
+
+        assert_eq!(result.action.args.get("key1").unwrap(), "val1");
+        assert_eq!(result.action.args.get("key2").unwrap(), "val2");
+        assert_eq!(result.action.timeouts.execution_timeout_secs, Some(3600));
+    }
+}

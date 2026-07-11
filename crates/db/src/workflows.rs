@@ -220,3 +220,191 @@ fn parse_datetime(s: &str) -> Result<DateTime<Utc>, Box<dyn std::error::Error + 
     }
     Err(format!("Failed to parse datetime: {}", s).into())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use khronos_core::{Timeouts};
+    use rusqlite::Connection;
+    use uuid::Uuid;
+
+    fn test_conn() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::schema::migrate(&conn).unwrap();
+        conn
+    }
+
+    fn make_workflow(run_id: Uuid) -> WorkflowInstance {
+        WorkflowInstance {
+            run_id,
+            workflow_id: format!("wf-{}", run_id.to_string().chars().take(8).collect::<String>()),
+            name: "test_workflow".to_string(),
+            task_queue: "default".to_string(),
+            state: WorkflowState::Pending,
+            args_json: serde_json::json!({"input": "data"}),
+            result_json: None,
+            timeouts: Timeouts {
+                execution_timeout_secs: Some(3600),
+                run_timeout_secs: Some(1800),
+                task_timeout_secs: Some(300),
+            },
+            started_at: None,
+            completed_at: None,
+            namespace: "default".to_string(),
+        }
+    }
+
+    #[test]
+    fn test_insert_and_get_workflow() {
+        let conn = test_conn();
+        let run_id = Uuid::new_v4();
+        let wf = make_workflow(run_id);
+        insert_workflow(&conn, &wf).unwrap();
+
+        let result = get_workflow(&conn, &run_id.to_string()).unwrap().expect("Workflow should exist");
+        assert_eq!(result.run_id, run_id);
+        assert_eq!(result.name, "test_workflow");
+        assert_eq!(result.state, WorkflowState::Pending);
+    }
+
+    #[test]
+    fn test_get_nonexistent_workflow() {
+        let conn = test_conn();
+        let result = get_workflow(&conn, "00000000-0000-0000-0000-000000000000").unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_list_workflows_empty() {
+        let conn = test_conn();
+        let workflows = list_workflows(&conn, "default", None).unwrap();
+        assert!(workflows.is_empty());
+    }
+
+    #[test]
+    fn test_list_workflows_multiple() {
+        let conn = test_conn();
+        insert_workflow(&conn, &make_workflow(Uuid::new_v4())).unwrap();
+        insert_workflow(&conn, &make_workflow(Uuid::new_v4())).unwrap();
+
+        let workflows = list_workflows(&conn, "default", None).unwrap();
+        assert_eq!(workflows.len(), 2);
+    }
+
+    #[test]
+    fn test_list_workflows_state_filter() {
+        let conn = test_conn();
+        let run_id1 = Uuid::new_v4();
+        let mut wf1 = make_workflow(run_id1);
+        wf1.state = WorkflowState::Pending;
+        insert_workflow(&conn, &wf1).unwrap();
+
+        let run_id2 = Uuid::new_v4();
+        let mut wf2 = make_workflow(run_id2);
+        wf2.state = WorkflowState::Running;
+        insert_workflow(&conn, &wf2).unwrap();
+
+        assert_eq!(list_workflows(&conn, "default", Some(WorkflowState::Pending)).unwrap().len(), 1);
+        assert_eq!(list_workflows(&conn, "default", Some(WorkflowState::Running)).unwrap().len(), 1);
+        assert_eq!(list_workflows(&conn, "default", None).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn test_update_workflow_state() {
+        let conn = test_conn();
+        let run_id = Uuid::new_v4();
+        insert_workflow(&conn, &make_workflow(run_id)).unwrap();
+
+        update_workflow_state(&conn, &run_id.to_string(), WorkflowState::Running, None, None).unwrap();
+        let result = get_workflow(&conn, &run_id.to_string()).unwrap().expect("Workflow should exist");
+        assert_eq!(result.state, WorkflowState::Running);
+
+        let completed_at = Utc::now();
+        update_workflow_state(
+            &conn,
+            &run_id.to_string(),
+            WorkflowState::Completed,
+            Some(&serde_json::json!({"output": "done"})),
+            Some(completed_at),
+        ).unwrap();
+
+        let result = get_workflow(&conn, &run_id.to_string()).unwrap().expect("Workflow should exist");
+        assert_eq!(result.state, WorkflowState::Completed);
+        assert!(result.result_json.is_some());
+        assert!(result.completed_at.is_some());
+    }
+
+    #[test]
+    fn test_cancel_workflow() {
+        let conn = test_conn();
+        let run_id = Uuid::new_v4();
+        insert_workflow(&conn, &make_workflow(run_id)).unwrap();
+
+        cancel_workflow(&conn, &run_id.to_string()).unwrap();
+        let result = get_workflow(&conn, &run_id.to_string()).unwrap().expect("Workflow should exist");
+        assert_eq!(result.state, WorkflowState::Cancelled);
+    }
+
+    #[test]
+    fn test_cancel_already_completed_workflow() {
+        let conn = test_conn();
+        let run_id = Uuid::new_v4();
+        let mut wf = make_workflow(run_id);
+        wf.state = WorkflowState::Completed;
+        insert_workflow(&conn, &wf).unwrap();
+
+        // Cancelling a completed workflow should fail
+        assert!(cancel_workflow(&conn, &run_id.to_string()).is_err());
+    }
+
+    #[test]
+    fn test_cancel_nonexistent_workflow() {
+        let conn = test_conn();
+        assert!(cancel_workflow(&conn, "00000000-0000-0000-0000-000000000000").is_err());
+    }
+
+    #[test]
+    fn test_workflow_namespace_filter() {
+        let conn = test_conn();
+        let run_id1 = Uuid::new_v4();
+        insert_workflow(&conn, &make_workflow(run_id1)).unwrap();
+
+        let run_id2 = Uuid::new_v4();
+        let mut wf2 = make_workflow(run_id2);
+        wf2.namespace = "other".to_string();
+        insert_workflow(&conn, &wf2).unwrap();
+
+        assert_eq!(list_workflows(&conn, "default", None).unwrap().len(), 1);
+        assert_eq!(list_workflows(&conn, "other", None).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn test_workflow_round_trip_with_timeouts() {
+        let conn = test_conn();
+        let run_id = Uuid::new_v4();
+        let wf = WorkflowInstance {
+            run_id,
+            workflow_id: "timeout-test".to_string(),
+            name: "wf".to_string(),
+            task_queue: "default".to_string(),
+            state: WorkflowState::Pending,
+            args_json: serde_json::json!({}),
+            result_json: None,
+            timeouts: Timeouts {
+                execution_timeout_secs: Some(7200),
+                run_timeout_secs: Some(3600),
+                task_timeout_secs: Some(600),
+            },
+            started_at: None,
+            completed_at: None,
+            namespace: "default".to_string(),
+        };
+
+        insert_workflow(&conn, &wf).unwrap();
+        let result = get_workflow(&conn, &run_id.to_string()).unwrap().expect("Workflow should exist");
+
+        assert_eq!(result.timeouts.execution_timeout_secs, Some(7200));
+        assert_eq!(result.timeouts.run_timeout_secs, Some(3600));
+        assert_eq!(result.timeouts.task_timeout_secs, Some(600));
+    }
+}

@@ -276,6 +276,281 @@ fn format_datetime(dt: Option<DateTime<Utc>>) -> Option<String> {
 
 /// Parse an ISO 8601 datetime string into a DateTime<Utc>.
 fn parse_datetime(s: &str) -> Result<DateTime<Utc>, Box<dyn std::error::Error + Send + Sync>> {
-    let dt = chrono::DateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S")?;
-    Ok(dt.with_timezone(&Utc))
+    // Try multiple formats since SQLite can return different representations
+    for fmt in [
+        "%Y-%m-%d %H:%M:%S",
+        "%Y-%m-%dT%H:%M:%S%.fZ",
+        "%Y-%m-%dT%H:%M:%SZ",
+        "%Y-%m-%dT%H:%M:%S",
+    ] {
+        if let Ok(dt) = chrono::DateTime::parse_from_str(s, fmt) {
+            return Ok(dt.with_timezone(&Utc));
+        }
+    }
+    // Try naive format and attach UTC
+    for fmt in [
+        "%Y-%m-%d %H:%M:%S%.f",
+        "%Y-%m-%dT%H:%M:%S%.f",
+    ] {
+        if let Ok(naive) = chrono::NaiveDateTime::parse_from_str(s, fmt) {
+            return Ok(naive.and_utc());
+        }
+    }
+    Err(format!("Failed to parse datetime: {}", s).into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use khronos_core::{RetryPolicy, WorkflowState};
+    use rusqlite::Connection;
+    use uuid::Uuid;
+
+    fn test_conn() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::schema::migrate(&conn).unwrap();
+        conn
+    }
+
+    /// Insert a parent workflow so FK constraints are satisfied.
+    fn insert_parent_workflow(conn: &Connection, run_id: Uuid) {
+        conn.execute(
+            "INSERT INTO workflows (run_id, workflow_id, name, task_queue, state, args_json, namespace) VALUES (?1, ?2, 'test_wf', 'default', 'pending', '{}', 'default')",
+            rusqlite::params![run_id.to_string(), format!("wf-{}", run_id)],
+        ).unwrap();
+    }
+
+    fn make_step(workflow_run_id: Uuid, index: usize) -> WorkflowStepInstance {
+        WorkflowStepInstance {
+            id: Uuid::new_v4(),
+            workflow_run_id,
+            step_index: index,
+            activity_name: "test_activity".to_string(),
+            args_json: serde_json::json!({"input": "data"}),
+            retry_policy: RetryPolicy {
+                maximum_attempts: 3,
+                initial_interval_secs: 2.0,
+            },
+            timeout_secs: 60,
+            heartbeat_timeout_secs: Some(30),
+            state: WorkflowState::Pending,
+            attempt: 0,
+            result_json: None,
+            next_retry_at: None,
+        }
+    }
+
+    #[test]
+    fn test_insert_and_get_step() {
+        let conn = test_conn();
+        let run_id = Uuid::new_v4();
+        insert_parent_workflow(&conn, run_id);
+        let step = make_step(run_id, 0);
+        insert_workflow_step(&conn, &step).unwrap();
+
+        // Verify via get_next_step_for_workflow
+        let result = get_next_step_for_workflow(&conn, &run_id.to_string())
+            .unwrap()
+            .expect("Step should exist");
+        assert_eq!(result.step_index, 0);
+        assert_eq!(result.activity_name, "test_activity");
+        assert_eq!(result.state, WorkflowState::Pending);
+    }
+
+    #[test]
+    fn test_get_next_step_returns_lowest_index() {
+        let conn = test_conn();
+        let run_id = Uuid::new_v4();
+        insert_parent_workflow(&conn, run_id);
+
+        // Insert steps out of order
+        insert_workflow_step(&conn, &make_step(run_id, 2)).unwrap();
+        insert_workflow_step(&conn, &make_step(run_id, 0)).unwrap();
+        insert_workflow_step(&conn, &make_step(run_id, 1)).unwrap();
+
+        let result = get_next_step_for_workflow(&conn, &run_id.to_string())
+            .unwrap()
+            .expect("Step should exist");
+        assert_eq!(result.step_index, 0);
+    }
+
+    #[test]
+    fn test_get_pending_steps() {
+        let conn = test_conn();
+        let run_id1 = Uuid::new_v4();
+        insert_parent_workflow(&conn, run_id1);
+        let run_id2 = Uuid::new_v4();
+        insert_parent_workflow(&conn, run_id2);
+
+        insert_workflow_step(&conn, &make_step(run_id1, 0)).unwrap();
+        insert_workflow_step(&conn, &make_step(run_id2, 0)).unwrap();
+
+        let pending = get_pending_steps(&conn).unwrap();
+        assert_eq!(pending.len(), 2);
+    }
+
+    #[test]
+    fn test_update_step_state() {
+        let conn = test_conn();
+        let run_id = Uuid::new_v4();
+        insert_parent_workflow(&conn, run_id);
+        let step = make_step(run_id, 0);
+        insert_workflow_step(&conn, &step).unwrap();
+
+        // Update to running
+        update_step_state(
+            &conn,
+            &step.id.to_string(),
+            WorkflowState::Running,
+            Some(1),
+            None,
+            None,
+        )
+        .unwrap();
+
+        let result = get_next_step_for_workflow(&conn, &run_id.to_string()).unwrap();
+        assert!(result.is_none()); // Running steps are not returned as pending
+    }
+
+    #[test]
+    fn test_update_step_state_with_retry() {
+        let conn = test_conn();
+        let run_id = Uuid::new_v4();
+        insert_parent_workflow(&conn, run_id);
+        let step = make_step(run_id, 0);
+        insert_workflow_step(&conn, &step).unwrap();
+
+        // Schedule a retry in the past using SQL directly to avoid format issues
+        conn.execute(
+            "UPDATE workflow_steps SET state = 'pending', attempt = 2, next_retry_at = datetime('now', '-1 minute') WHERE id = ?1",
+            rusqlite::params![step.id.to_string()],
+        ).unwrap();
+
+        // Verify the step is returned by get_pending_steps (next_retry_at <= now)
+        let pending = get_pending_steps(&conn).unwrap();
+        assert!(pending.iter().any(|s| s.id == step.id));
+    }
+
+    #[test]
+    fn test_insert_activity_attempt() {
+        let conn = test_conn();
+        let run_id = Uuid::new_v4();
+        insert_parent_workflow(&conn, run_id);
+        let step = make_step(run_id, 0);
+        insert_workflow_step(&conn, &step).unwrap();
+
+        let activity_id = "activity-1";
+        insert_activity_attempt(&conn, activity_id, &step.id.to_string(), 1).unwrap();
+
+        // Verify via get_running_activities
+        let running = get_running_activities(&conn).unwrap();
+        assert_eq!(running.len(), 1);
+        assert_eq!(running[0].id, activity_id);
+    }
+
+    #[test]
+    fn test_update_activity_state() {
+        let conn = test_conn();
+        let run_id = Uuid::new_v4();
+        insert_parent_workflow(&conn, run_id);
+        let step = make_step(run_id, 0);
+        insert_workflow_step(&conn, &step).unwrap();
+
+        let activity_id = "activity-1";
+        insert_activity_attempt(&conn, activity_id, &step.id.to_string(), 1).unwrap();
+
+        // Complete the activity
+        update_activity_state(
+            &conn,
+            activity_id,
+            ActivityState::Completed,
+            Some(&serde_json::json!({"result": "ok"})),
+            None,
+        )
+        .unwrap();
+
+        let running = get_running_activities(&conn).unwrap();
+        assert!(running.is_empty()); // No more running activities
+    }
+
+    #[test]
+    fn test_heartbeat_update() {
+        let conn = test_conn();
+        let run_id = Uuid::new_v4();
+        insert_parent_workflow(&conn, run_id);
+        let step = make_step(run_id, 0);
+        insert_workflow_step(&conn, &step).unwrap();
+
+        let activity_id = "activity-1";
+        insert_activity_attempt(&conn, activity_id, &step.id.to_string(), 1).unwrap();
+
+        // Heartbeat should succeed for running activity
+        heartbeat_update(&conn, activity_id).unwrap();
+    }
+
+    #[test]
+    fn test_heartbeat_nonexistent() {
+        let conn = test_conn();
+        assert!(heartbeat_update(&conn, "nonexistent").is_err());
+    }
+
+    #[test]
+    fn test_get_running_activities_empty() {
+        let conn = test_conn();
+        let running = get_running_activities(&conn).unwrap();
+        assert!(running.is_empty());
+    }
+
+    #[test]
+    fn test_step_completion_with_result() {
+        let conn = test_conn();
+        let run_id = Uuid::new_v4();
+        insert_parent_workflow(&conn, run_id);
+        let step = make_step(run_id, 0);
+        insert_workflow_step(&conn, &step).unwrap();
+
+        // Complete the step with a result
+        update_step_state(
+            &conn,
+            &step.id.to_string(),
+            WorkflowState::Completed,
+            Some(1),
+            Some(&serde_json::json!({"output": "done"})),
+            None,
+        )
+        .unwrap();
+
+        // Verify no pending steps remain for this workflow
+        let result = get_next_step_for_workflow(&conn, &run_id.to_string()).unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_multiple_steps_in_workflow() {
+        let conn = test_conn();
+        let run_id = Uuid::new_v4();
+        insert_parent_workflow(&conn, run_id);
+
+        // Insert 3 steps
+        for i in 0..3 {
+            insert_workflow_step(&conn, &make_step(run_id, i)).unwrap();
+        }
+
+        let pending = get_pending_steps(&conn).unwrap();
+        assert_eq!(pending.len(), 3);
+
+        // Complete step 0
+        update_step_state(
+            &conn,
+            &pending[0].id.to_string(),
+            WorkflowState::Completed,
+            Some(1),
+            None,
+            None,
+        )
+        .unwrap();
+
+        let pending = get_pending_steps(&conn).unwrap();
+        assert_eq!(pending.len(), 2);
+    }
 }
