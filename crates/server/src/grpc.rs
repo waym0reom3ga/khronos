@@ -8,6 +8,9 @@ use chrono::Utc;
 use khronos_core::{OverlapPolicy as CoreOverlapPolicy, RetryPolicy as CoreRetryPolicy, Schedule, ScheduleSpec as CoreScheduleSpec, Timeouts as CoreTimeouts, WorkflowAction as CoreWorkflowAction, WorkflowInstance, WorkflowState, WorkflowStepInstance};
 use khronos_db::activities::{self as db_activities};
 use khronos_db::schedules::{self as db_schedules};
+
+// Temporal WorkflowService trait
+use crate::temporal::api::workflowservice::v1::workflow_service_server::WorkflowService as TemporalWorkflowService;
 use khronos_db::workflows::{self as db_workflows};
 use khronos_db::Database;
 use tokio::sync::Mutex;
@@ -555,6 +558,1244 @@ impl WorkerService for KhronosState {
     }
 }
 
+// ─── Temporal WorkflowService ──────────────────────────────────────────────
+
+#[async_trait]
+impl TemporalWorkflowService for KhronosState {
+    async fn register_namespace(
+        &self,
+        request: Request<crate::temporal::api::workflowservice::v1::RegisterNamespaceRequest>,
+    ) -> Result<Response<crate::temporal::api::workflowservice::v1::RegisterNamespaceResponse>, Status> {
+        let req = request.into_inner();
+        let namespace = req.namespace;
+
+        // Create namespace in DB if it doesn't exist
+        let db = self.db.lock().await;
+        let conn = db.connection();
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM namespaces WHERE name = ?1",
+            [&namespace],
+            |row| row.get(0),
+        ).unwrap_or(0);
+
+        if count == 0 {
+            conn.execute(
+                "INSERT INTO namespaces (name, created_at, updated_at) VALUES (?1, strftime('%s', 'now'), strftime('%s', 'now'))",
+                [&namespace],
+            ).map_err(|e| Status::internal(format!("Failed to create namespace: {}", e)))?;
+        }
+
+        Ok(Response::new(crate::temporal::api::workflowservice::v1::RegisterNamespaceResponse {
+            ..Default::default()
+        }))
+    }
+
+    async fn describe_namespace(
+        &self,
+        request: Request<crate::temporal::api::workflowservice::v1::DescribeNamespaceRequest>,
+    ) -> Result<Response<crate::temporal::api::workflowservice::v1::DescribeNamespaceResponse>, Status> {
+        let req = request.into_inner();
+        let namespace = req.namespace;
+
+        let db = self.db.lock().await;
+        let conn = db.connection();
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM namespaces WHERE name = ?1",
+            [&namespace],
+            |row| row.get(0),
+        ).unwrap_or(0);
+
+        if count == 0 {
+            return Err(Status::not_found(format!("Namespace '{}' not found", namespace)));
+        }
+
+        Ok(Response::new(crate::temporal::api::workflowservice::v1::DescribeNamespaceResponse {
+            namespace_info: Some(crate::temporal::api::namespace::v1::NamespaceInfo {
+                name: namespace,
+                ..Default::default()
+            }),
+            ..Default::default()
+        }))
+    }
+
+    async fn get_system_info(
+        &self,
+        _request: Request<crate::temporal::api::workflowservice::v1::GetSystemInfoRequest>,
+    ) -> Result<Response<crate::temporal::api::workflowservice::v1::GetSystemInfoResponse>, Status> {
+        Ok(Response::new(crate::temporal::api::workflowservice::v1::GetSystemInfoResponse {
+            server_version: env!("CARGO_PKG_VERSION").to_string(),
+            ..Default::default()
+        }))
+    }
+
+    async fn start_workflow_execution(
+        &self,
+        request: Request<crate::temporal::api::workflowservice::v1::StartWorkflowExecutionRequest>,
+    ) -> Result<Response<crate::temporal::api::workflowservice::v1::StartWorkflowExecutionResponse>, Status> {
+        let req = request.into_inner();
+        let run_id = uuid::Uuid::new_v4();
+        let namespace = if req.namespace.is_empty() { "default".to_string() } else { req.namespace };
+
+        // Convert args to JSON
+        let args_json: serde_json::Value = if let Some(input) = &req.input {
+            if input.payloads.is_empty() {
+                serde_json::json!({})
+            } else {
+                serde_json::json!(input.payloads.iter().map(|p| String::from_utf8_lossy(&p.data).to_string()).collect::<Vec<_>>())
+            }
+        } else {
+            serde_json::json!({})
+        };
+
+        // Convert timeouts
+        let timeouts = CoreTimeouts {
+            execution_timeout_secs: req.workflow_execution_timeout.as_ref().map(|t| t.seconds as u64),
+            run_timeout_secs: req.workflow_run_timeout.as_ref().map(|t| t.seconds as u64),
+            task_timeout_secs: req.workflow_task_timeout.as_ref().map(|t| t.seconds as u64),
+        };
+
+        let workflow_name = req.workflow_type.as_ref().map(|wt| wt.name.clone()).unwrap_or_default();
+        let task_queue = req.task_queue.as_ref().map(|tq| tq.name.clone()).unwrap_or_else(|| "default".to_string());
+
+        let workflow = WorkflowInstance {
+            run_id,
+            workflow_id: req.workflow_id.clone(),
+            name: workflow_name.clone(),
+            task_queue: task_queue.clone(),
+            state: WorkflowState::Pending,
+            args_json: args_json.clone(),
+            result_json: None,
+            timeouts,
+            started_at: None,
+            completed_at: None,
+            namespace: namespace.clone(),
+        };
+
+        let db = self.db.lock().await;
+        db_workflows::insert_workflow(&db.connection(), &workflow)
+            .map_err(|e| Status::internal(format!("Failed to create workflow: {}", e)))?;
+
+        // Create workflow steps
+        let steps = get_workflow_definition(&workflow_name);
+        for (index, step_def) in steps.iter().enumerate() {
+            let step = WorkflowStepInstance {
+                id: uuid::Uuid::new_v4(),
+                workflow_run_id: run_id,
+                step_index: index,
+                activity_name: step_def.activity_name.clone(),
+                args_json: args_json.clone(),
+                retry_policy: step_def.retry_policy.clone(),
+                timeout_secs: step_def.timeout_secs,
+                heartbeat_timeout_secs: step_def.heartbeat_timeout_secs,
+                state: WorkflowState::Pending,
+                attempt: 0,
+                result_json: None,
+                next_retry_at: None,
+            };
+
+            db_activities::insert_workflow_step(&db.connection(), &step)
+                .map_err(|e| Status::internal(format!("Failed to create step {}: {}", index, e)))?;
+        }
+
+        Ok(Response::new(crate::temporal::api::workflowservice::v1::StartWorkflowExecutionResponse {
+            run_id: run_id.to_string(),
+            started: true,
+            ..Default::default()
+        }))
+    }
+
+    async fn poll_activity_task_queue(
+        &self,
+        request: Request<crate::temporal::api::workflowservice::v1::PollActivityTaskQueueRequest>,
+    ) -> Result<Response<crate::temporal::api::workflowservice::v1::PollActivityTaskQueueResponse>, Status> {
+        let req = request.into_inner();
+        let task_queue = req.task_queue.as_ref().map(|tq| tq.name.clone()).unwrap_or_default();
+
+        // Find pending steps that match the task queue
+        let db = self.db.lock().await;
+        let conn = db.connection();
+
+        let pending_steps = db_activities::get_pending_steps(&conn)
+            .map_err(|e| Status::internal(format!("Failed to get pending steps: {}", e)))?;
+
+        for step in &pending_steps {
+            // Check if this step belongs to a workflow in the same task queue
+            let wf_queue: String = conn.query_row(
+                "SELECT task_queue FROM workflows WHERE run_id = ?1",
+                [&step.workflow_run_id.to_string()],
+                |row| row.get(0),
+            ).unwrap_or_default();
+
+            if wf_queue == task_queue {
+                let activity_id = uuid::Uuid::new_v4();
+                let new_attempt = step.attempt + 1;
+
+                db_activities::update_step_state(
+                    &conn,
+                    &step.id.to_string(),
+                    WorkflowState::Running,
+                    Some(new_attempt),
+                    None,
+                    None,
+                ).map_err(|e| Status::internal(format!("Failed to update step state: {}", e)))?;
+
+                db_activities::insert_activity_attempt(
+                    &conn,
+                    &activity_id.to_string(),
+                    &step.id.to_string(),
+                    new_attempt,
+                ).map_err(|e| Status::internal(format!("Failed to insert activity: {}", e)))?;
+
+                db_workflows::update_workflow_state(
+                    &conn,
+                    &step.workflow_run_id.to_string(),
+                    WorkflowState::Running,
+                    None,
+                    Some(Utc::now()),
+                ).ok();
+
+                // Convert args to proto format
+                let args: Vec<crate::temporal::api::common::v1::Payload> = if let serde_json::Value::Object(map) = &step.args_json {
+                    map.iter().map(|(k, v)| {
+                        crate::temporal::api::common::v1::Payload {
+                            metadata: HashMap::new(),
+                            data: v.to_string().into_bytes(),
+                            external_payloads: vec![],
+                        }
+                    }).collect()
+                } else {
+                    vec![]
+                };
+
+                return Ok(Response::new(crate::temporal::api::workflowservice::v1::PollActivityTaskQueueResponse {
+                    task_token: activity_id.to_string().into_bytes(),
+                    workflow_namespace: step.workflow_run_id.to_string(),
+                    activity_id: step.activity_name.clone(),
+                    activity_type: Some(crate::temporal::api::common::v1::ActivityType {
+                        name: step.activity_name.clone(),
+                    }),
+                    header: None,
+                    input: Some(crate::temporal::api::common::v1::Payloads { payloads: args }),
+                    heartbeat_timeout: Some(prost_types::Duration {
+                        seconds: step.heartbeat_timeout_secs.unwrap_or(30) as i64,
+                        nanos: 0,
+                    }),
+                    schedule_to_close_timeout: Some(prost_types::Duration {
+                        seconds: step.timeout_secs as i64,
+                        nanos: 0,
+                    }),
+                    start_to_close_timeout: Some(prost_types::Duration {
+                        seconds: step.timeout_secs as i64,
+                        nanos: 0,
+                    }),
+                    ..Default::default()
+                }));
+            }
+        }
+
+        // No task found
+        Ok(Response::new(crate::temporal::api::workflowservice::v1::PollActivityTaskQueueResponse {
+            ..Default::default()
+        }))
+    }
+
+    async fn respond_activity_task_completed(
+        &self,
+        request: Request<crate::temporal::api::workflowservice::v1::RespondActivityTaskCompletedRequest>,
+    ) -> Result<Response<crate::temporal::api::workflowservice::v1::RespondActivityTaskCompletedResponse>, Status> {
+        let req = request.into_inner();
+        let activity_id = String::from_utf8_lossy(&req.task_token).to_string();
+
+        let db = self.db.lock().await;
+        let conn = db.connection();
+
+        // Parse result
+        let result_json: serde_json::Value = if let Some(result) = req.result {
+            if let Some(payload) = result.payloads.first() {
+                serde_json::from_slice(&payload.data).unwrap_or(serde_json::json!(String::from_utf8_lossy(&payload.data)))
+            } else {
+                serde_json::json!({})
+            }
+        } else {
+            serde_json::json!({})
+        };
+
+        db_activities::update_activity_state(
+            &conn,
+            &activity_id,
+            khronos_core::ActivityState::Completed,
+            Some(&result_json),
+            None,
+        ).map_err(|e| Status::internal(format!("Failed to update activity: {}", e)))?;
+
+        let step_id: String = conn.query_row(
+            "SELECT step_id FROM activities WHERE id = ?1",
+            [&activity_id],
+            |row| row.get(0),
+        ).map_err(|e| Status::internal(format!("Failed to find activity: {}", e)))?;
+
+        db_activities::update_step_state(
+            &conn,
+            &step_id,
+            WorkflowState::Completed,
+            None,
+            Some(&result_json),
+            None,
+        ).map_err(|e| Status::internal(format!("Failed to update step: {}", e)))?;
+
+        Ok(Response::new(crate::temporal::api::workflowservice::v1::RespondActivityTaskCompletedResponse {
+            ..Default::default()
+        }))
+    }
+
+    async fn respond_activity_task_failed(
+        &self,
+        request: Request<crate::temporal::api::workflowservice::v1::RespondActivityTaskFailedRequest>,
+    ) -> Result<Response<crate::temporal::api::workflowservice::v1::RespondActivityTaskFailedResponse>, Status> {
+        let req = request.into_inner();
+        let activity_id = String::from_utf8_lossy(&req.task_token).to_string();
+
+        let db = self.db.lock().await;
+        let conn = db.connection();
+
+        let (step_id, attempt): (String, u32) = conn.query_row(
+            "SELECT a.step_id, a.attempt FROM activities a WHERE a.id = ?1",
+            [&activity_id],
+            |row| Ok((row.get(0)?, row.get::<_, i64>(1)? as u32)),
+        ).map_err(|e| Status::internal(format!("Failed to find activity: {}", e)))?;
+
+        let retry_policy_json: String = conn.query_row(
+            "SELECT retry_policy_json FROM workflow_steps WHERE id = ?1",
+            [&step_id],
+            |row| row.get(0),
+        ).map_err(|e| Status::internal(format!("Failed to get retry policy: {}", e)))?;
+
+        let retry_policy: CoreRetryPolicy = serde_json::from_str(&retry_policy_json)
+            .map_err(|e| Status::internal(format!("Invalid retry policy JSON: {}", e)))?;
+
+        let error_message = req.failure.as_ref().map(|f| f.message.clone()).unwrap_or_default();
+
+        db_activities::update_activity_state(
+            &conn,
+            &activity_id,
+            khronos_core::ActivityState::Failed,
+            None,
+            Some(&error_message),
+        ).map_err(|e| Status::internal(format!("Failed to update activity: {}", e)))?;
+
+        let current_attempt = attempt + 1;
+        if current_attempt < retry_policy.maximum_attempts {
+            let backoff_secs = retry_policy.initial_interval_secs * (2.0_f64.powi((current_attempt - 1) as i32));
+            let next_retry_at = Utc::now() + chrono::Duration::seconds(backoff_secs as i64);
+
+            db_activities::update_step_state(
+                &conn,
+                &step_id,
+                WorkflowState::Pending,
+                Some(current_attempt),
+                None,
+                Some(next_retry_at),
+            ).map_err(|e| Status::internal(format!("Failed to schedule retry: {}", e)))?;
+        } else {
+            db_activities::update_step_state(
+                &conn,
+                &step_id,
+                WorkflowState::Failed,
+                Some(current_attempt),
+                None,
+                None,
+            ).map_err(|e| Status::internal(format!("Failed to mark step as failed: {}", e)))?;
+        }
+
+        Ok(Response::new(crate::temporal::api::workflowservice::v1::RespondActivityTaskFailedResponse {
+            ..Default::default()
+        }))
+    }
+
+    // Stub implementations for required RPCs (not used by autolycus but required by trait)
+    async fn get_workflow_execution_history(
+        &self,
+        _request: Request<crate::temporal::api::workflowservice::v1::GetWorkflowExecutionHistoryRequest>,
+    ) -> Result<Response<crate::temporal::api::workflowservice::v1::GetWorkflowExecutionHistoryResponse>, Status> {
+        Ok(Response::new(Default::default()))
+    }
+
+    async fn poll_workflow_task_queue(
+        &self,
+        _request: Request<crate::temporal::api::workflowservice::v1::PollWorkflowTaskQueueRequest>,
+    ) -> Result<Response<crate::temporal::api::workflowservice::v1::PollWorkflowTaskQueueResponse>, Status> {
+        Ok(Response::new(Default::default()))
+    }
+
+    async fn respond_workflow_task_completed(
+        &self,
+        _request: Request<crate::temporal::api::workflowservice::v1::RespondWorkflowTaskCompletedRequest>,
+    ) -> Result<Response<crate::temporal::api::workflowservice::v1::RespondWorkflowTaskCompletedResponse>, Status> {
+        Ok(Response::new(Default::default()))
+    }
+
+    async fn respond_workflow_task_failed(
+        &self,
+        _request: Request<crate::temporal::api::workflowservice::v1::RespondWorkflowTaskFailedRequest>,
+    ) -> Result<Response<crate::temporal::api::workflowservice::v1::RespondWorkflowTaskFailedResponse>, Status> {
+        Ok(Response::new(Default::default()))
+    }
+
+    async fn create_schedule(
+        &self,
+        request: Request<crate::temporal::api::workflowservice::v1::CreateScheduleRequest>,
+    ) -> Result<Response<crate::temporal::api::workflowservice::v1::CreateScheduleResponse>, Status> {
+        let req = request.into_inner();
+        let schedule_id = req.schedule_id;
+        let namespace = if req.namespace.is_empty() { "default".to_string() } else { req.namespace };
+
+        // Parse schedule spec from Temporal format
+        let schedule = req.schedule.ok_or_else(|| Status::invalid_argument("schedule is required"))?;
+
+        // Create schedule in DB
+        let db = self.db.lock().await;
+        let conn = db.connection();
+
+        // Insert schedule record
+        conn.execute(
+            "INSERT INTO schedules (schedule_id, namespace, spec_type, spec_data, workflow_name, task_queue, created_at, updated_at) \
+             VALUES (?1, ?2, 'temporal', '', '', '', strftime('%s', 'now'), strftime('%s', 'now'))",
+            rusqlite::params![
+                schedule_id,
+                namespace,
+            ],
+        ).map_err(|e| Status::internal(format!("Failed to create schedule: {}", e)))?;
+
+        Ok(Response::new(crate::temporal::api::workflowservice::v1::CreateScheduleResponse {
+            ..Default::default()
+        }))
+    }
+
+    async fn update_schedule(
+        &self,
+        request: Request<crate::temporal::api::workflowservice::v1::UpdateScheduleRequest>,
+    ) -> Result<Response<crate::temporal::api::workflowservice::v1::UpdateScheduleResponse>, Status> {
+        let req = request.into_inner();
+        let schedule_id = req.schedule_id;
+        let namespace = if req.namespace.is_empty() { "default".to_string() } else { req.namespace };
+
+        let db = self.db.lock().await;
+        let conn = db.connection();
+
+        conn.execute(
+            "UPDATE schedules SET spec_data = ?1, updated_at = strftime('%s', 'now') \
+             WHERE schedule_id = ?2 AND namespace = ?3",
+            rusqlite::params![
+                "",
+                schedule_id,
+                namespace,
+            ],
+        ).map_err(|e| Status::internal(format!("Failed to update schedule: {}", e)))?;
+
+        Ok(Response::new(crate::temporal::api::workflowservice::v1::UpdateScheduleResponse {
+            ..Default::default()
+        }))
+    }
+
+    async fn describe_schedule(
+        &self,
+        request: Request<crate::temporal::api::workflowservice::v1::DescribeScheduleRequest>,
+    ) -> Result<Response<crate::temporal::api::workflowservice::v1::DescribeScheduleResponse>, Status> {
+        let _req = request.into_inner();
+        // Stub for now
+        Ok(Response::new(Default::default()))
+    }
+
+    async fn patch_schedule(
+        &self,
+        request: Request<crate::temporal::api::workflowservice::v1::PatchScheduleRequest>,
+    ) -> Result<Response<crate::temporal::api::workflowservice::v1::PatchScheduleResponse>, Status> {
+        let _req = request.into_inner();
+        // Stub for now
+        Ok(Response::new(Default::default()))
+    }
+
+    async fn list_schedules(
+        &self,
+        _request: Request<crate::temporal::api::workflowservice::v1::ListSchedulesRequest>,
+    ) -> Result<Response<crate::temporal::api::workflowservice::v1::ListSchedulesResponse>, Status> {
+        Ok(Response::new(Default::default()))
+    }
+
+    async fn delete_schedule(
+        &self,
+        request: Request<crate::temporal::api::workflowservice::v1::DeleteScheduleRequest>,
+    ) -> Result<Response<crate::temporal::api::workflowservice::v1::DeleteScheduleResponse>, Status> {
+        let req = request.into_inner();
+        let schedule_id = req.schedule_id;
+        let namespace = if req.namespace.is_empty() { "default".to_string() } else { req.namespace };
+
+        let db = self.db.lock().await;
+        let conn = db.connection();
+
+        conn.execute(
+            "DELETE FROM schedules WHERE schedule_id = ?1 AND namespace = ?2",
+            rusqlite::params![schedule_id, namespace],
+        ).map_err(|e| Status::internal(format!("Failed to delete schedule: {}", e)))?;
+
+        Ok(Response::new(crate::temporal::api::workflowservice::v1::DeleteScheduleResponse {
+            ..Default::default()
+        }))
+    }
+
+    async fn describe_workflow_execution(
+        &self,
+        _request: Request<crate::temporal::api::workflowservice::v1::DescribeWorkflowExecutionRequest>,
+    ) -> Result<Response<crate::temporal::api::workflowservice::v1::DescribeWorkflowExecutionResponse>, Status> {
+        // Stub for now - returns empty response
+        Ok(Response::new(Default::default()))
+    }
+
+    // ─── Stub implementations for remaining required RPCs ───────────
+
+    // Namespace management
+    async fn list_namespaces(
+        &self,
+        _request: Request<crate::temporal::api::workflowservice::v1::ListNamespacesRequest>,
+    ) -> Result<Response<crate::temporal::api::workflowservice::v1::ListNamespacesResponse>, Status> {
+        Ok(Response::new(Default::default()))
+    }
+
+    async fn update_namespace(
+        &self,
+        _request: Request<crate::temporal::api::workflowservice::v1::UpdateNamespaceRequest>,
+    ) -> Result<Response<crate::temporal::api::workflowservice::v1::UpdateNamespaceResponse>, Status> {
+        Ok(Response::new(Default::default()))
+    }
+
+    async fn deprecate_namespace(
+        &self,
+        _request: Request<crate::temporal::api::workflowservice::v1::DeprecateNamespaceRequest>,
+    ) -> Result<Response<crate::temporal::api::workflowservice::v1::DeprecateNamespaceResponse>, Status> {
+        Ok(Response::new(Default::default()))
+    }
+
+    // Workflow execution
+    async fn execute_multi_operation(
+        &self,
+        _request: Request<crate::temporal::api::workflowservice::v1::ExecuteMultiOperationRequest>,
+    ) -> Result<Response<crate::temporal::api::workflowservice::v1::ExecuteMultiOperationResponse>, Status> {
+        Ok(Response::new(Default::default()))
+    }
+
+    async fn get_workflow_execution_history_reverse(
+        &self,
+        _request: Request<crate::temporal::api::workflowservice::v1::GetWorkflowExecutionHistoryReverseRequest>,
+    ) -> Result<Response<crate::temporal::api::workflowservice::v1::GetWorkflowExecutionHistoryReverseResponse>, Status> {
+        Ok(Response::new(Default::default()))
+    }
+
+    async fn request_cancel_workflow_execution(
+        &self,
+        _request: Request<crate::temporal::api::workflowservice::v1::RequestCancelWorkflowExecutionRequest>,
+    ) -> Result<Response<crate::temporal::api::workflowservice::v1::RequestCancelWorkflowExecutionResponse>, Status> {
+        Ok(Response::new(Default::default()))
+    }
+
+    async fn signal_workflow_execution(
+        &self,
+        _request: Request<crate::temporal::api::workflowservice::v1::SignalWorkflowExecutionRequest>,
+    ) -> Result<Response<crate::temporal::api::workflowservice::v1::SignalWorkflowExecutionResponse>, Status> {
+        Ok(Response::new(Default::default()))
+    }
+
+    async fn signal_with_start_workflow_execution(
+        &self,
+        _request: Request<crate::temporal::api::workflowservice::v1::SignalWithStartWorkflowExecutionRequest>,
+    ) -> Result<Response<crate::temporal::api::workflowservice::v1::SignalWithStartWorkflowExecutionResponse>, Status> {
+        Ok(Response::new(Default::default()))
+    }
+
+    async fn reset_workflow_execution(
+        &self,
+        _request: Request<crate::temporal::api::workflowservice::v1::ResetWorkflowExecutionRequest>,
+    ) -> Result<Response<crate::temporal::api::workflowservice::v1::ResetWorkflowExecutionResponse>, Status> {
+        Ok(Response::new(Default::default()))
+    }
+
+    async fn terminate_workflow_execution(
+        &self,
+        _request: Request<crate::temporal::api::workflowservice::v1::TerminateWorkflowExecutionRequest>,
+    ) -> Result<Response<crate::temporal::api::workflowservice::v1::TerminateWorkflowExecutionResponse>, Status> {
+        Ok(Response::new(Default::default()))
+    }
+
+    async fn delete_workflow_execution(
+        &self,
+        _request: Request<crate::temporal::api::workflowservice::v1::DeleteWorkflowExecutionRequest>,
+    ) -> Result<Response<crate::temporal::api::workflowservice::v1::DeleteWorkflowExecutionResponse>, Status> {
+        Ok(Response::new(Default::default()))
+    }
+
+    async fn list_open_workflow_executions(
+        &self,
+        _request: Request<crate::temporal::api::workflowservice::v1::ListOpenWorkflowExecutionsRequest>,
+    ) -> Result<Response<crate::temporal::api::workflowservice::v1::ListOpenWorkflowExecutionsResponse>, Status> {
+        Ok(Response::new(Default::default()))
+    }
+
+    async fn list_closed_workflow_executions(
+        &self,
+        _request: Request<crate::temporal::api::workflowservice::v1::ListClosedWorkflowExecutionsRequest>,
+    ) -> Result<Response<crate::temporal::api::workflowservice::v1::ListClosedWorkflowExecutionsResponse>, Status> {
+        Ok(Response::new(Default::default()))
+    }
+
+    async fn list_workflow_executions(
+        &self,
+        _request: Request<crate::temporal::api::workflowservice::v1::ListWorkflowExecutionsRequest>,
+    ) -> Result<Response<crate::temporal::api::workflowservice::v1::ListWorkflowExecutionsResponse>, Status> {
+        Ok(Response::new(Default::default()))
+    }
+
+    async fn list_archived_workflow_executions(
+        &self,
+        _request: Request<crate::temporal::api::workflowservice::v1::ListArchivedWorkflowExecutionsRequest>,
+    ) -> Result<Response<crate::temporal::api::workflowservice::v1::ListArchivedWorkflowExecutionsResponse>, Status> {
+        Ok(Response::new(Default::default()))
+    }
+
+    async fn scan_workflow_executions(
+        &self,
+        _request: Request<crate::temporal::api::workflowservice::v1::ScanWorkflowExecutionsRequest>,
+    ) -> Result<Response<crate::temporal::api::workflowservice::v1::ScanWorkflowExecutionsResponse>, Status> {
+        Ok(Response::new(Default::default()))
+    }
+
+    async fn count_workflow_executions(
+        &self,
+        _request: Request<crate::temporal::api::workflowservice::v1::CountWorkflowExecutionsRequest>,
+    ) -> Result<Response<crate::temporal::api::workflowservice::v1::CountWorkflowExecutionsResponse>, Status> {
+        Ok(Response::new(Default::default()))
+    }
+
+    // Activity task
+    async fn record_activity_task_heartbeat(
+        &self,
+        _request: Request<crate::temporal::api::workflowservice::v1::RecordActivityTaskHeartbeatRequest>,
+    ) -> Result<Response<crate::temporal::api::workflowservice::v1::RecordActivityTaskHeartbeatResponse>, Status> {
+        Ok(Response::new(Default::default()))
+    }
+
+    async fn record_activity_task_heartbeat_by_id(
+        &self,
+        _request: Request<crate::temporal::api::workflowservice::v1::RecordActivityTaskHeartbeatByIdRequest>,
+    ) -> Result<Response<crate::temporal::api::workflowservice::v1::RecordActivityTaskHeartbeatByIdResponse>, Status> {
+        Ok(Response::new(Default::default()))
+    }
+
+    async fn respond_activity_task_completed_by_id(
+        &self,
+        _request: Request<crate::temporal::api::workflowservice::v1::RespondActivityTaskCompletedByIdRequest>,
+    ) -> Result<Response<crate::temporal::api::workflowservice::v1::RespondActivityTaskCompletedByIdResponse>, Status> {
+        Ok(Response::new(Default::default()))
+    }
+
+    async fn respond_activity_task_failed_by_id(
+        &self,
+        _request: Request<crate::temporal::api::workflowservice::v1::RespondActivityTaskFailedByIdRequest>,
+    ) -> Result<Response<crate::temporal::api::workflowservice::v1::RespondActivityTaskFailedByIdResponse>, Status> {
+        Ok(Response::new(Default::default()))
+    }
+
+    async fn respond_activity_task_canceled(
+        &self,
+        _request: Request<crate::temporal::api::workflowservice::v1::RespondActivityTaskCanceledRequest>,
+    ) -> Result<Response<crate::temporal::api::workflowservice::v1::RespondActivityTaskCanceledResponse>, Status> {
+        Ok(Response::new(Default::default()))
+    }
+
+    async fn respond_activity_task_canceled_by_id(
+        &self,
+        _request: Request<crate::temporal::api::workflowservice::v1::RespondActivityTaskCanceledByIdRequest>,
+    ) -> Result<Response<crate::temporal::api::workflowservice::v1::RespondActivityTaskCanceledByIdResponse>, Status> {
+        Ok(Response::new(Default::default()))
+    }
+
+    // Query task
+    async fn respond_query_task_completed(
+        &self,
+        _request: Request<crate::temporal::api::workflowservice::v1::RespondQueryTaskCompletedRequest>,
+    ) -> Result<Response<crate::temporal::api::workflowservice::v1::RespondQueryTaskCompletedResponse>, Status> {
+        Ok(Response::new(Default::default()))
+    }
+
+    // Task queue
+    async fn reset_sticky_task_queue(
+        &self,
+        _request: Request<crate::temporal::api::workflowservice::v1::ResetStickyTaskQueueRequest>,
+    ) -> Result<Response<crate::temporal::api::workflowservice::v1::ResetStickyTaskQueueResponse>, Status> {
+        Ok(Response::new(Default::default()))
+    }
+
+    async fn describe_task_queue(
+        &self,
+        _request: Request<crate::temporal::api::workflowservice::v1::DescribeTaskQueueRequest>,
+    ) -> Result<Response<crate::temporal::api::workflowservice::v1::DescribeTaskQueueResponse>, Status> {
+        Ok(Response::new(Default::default()))
+    }
+
+    async fn list_task_queue_partitions(
+        &self,
+        _request: Request<crate::temporal::api::workflowservice::v1::ListTaskQueuePartitionsRequest>,
+    ) -> Result<Response<crate::temporal::api::workflowservice::v1::ListTaskQueuePartitionsResponse>, Status> {
+        Ok(Response::new(Default::default()))
+    }
+
+    // Cluster info
+    async fn get_cluster_info(
+        &self,
+        _request: Request<crate::temporal::api::workflowservice::v1::GetClusterInfoRequest>,
+    ) -> Result<Response<crate::temporal::api::workflowservice::v1::GetClusterInfoResponse>, Status> {
+        Ok(Response::new(Default::default()))
+    }
+
+    // Search attributes
+    async fn get_search_attributes(
+        &self,
+        _request: Request<crate::temporal::api::workflowservice::v1::GetSearchAttributesRequest>,
+    ) -> Result<Response<crate::temporal::api::workflowservice::v1::GetSearchAttributesResponse>, Status> {
+        Ok(Response::new(Default::default()))
+    }
+
+    // Schedule
+    async fn list_schedule_matching_times(
+        &self,
+        _request: Request<crate::temporal::api::workflowservice::v1::ListScheduleMatchingTimesRequest>,
+    ) -> Result<Response<crate::temporal::api::workflowservice::v1::ListScheduleMatchingTimesResponse>, Status> {
+        Ok(Response::new(Default::default()))
+    }
+
+    async fn count_schedules(
+        &self,
+        _request: Request<crate::temporal::api::workflowservice::v1::CountSchedulesRequest>,
+    ) -> Result<Response<crate::temporal::api::workflowservice::v1::CountSchedulesResponse>, Status> {
+        Ok(Response::new(Default::default()))
+    }
+
+    // Worker deployment
+    async fn update_worker_build_id_compatibility(
+        &self,
+        _request: Request<crate::temporal::api::workflowservice::v1::UpdateWorkerBuildIdCompatibilityRequest>,
+    ) -> Result<Response<crate::temporal::api::workflowservice::v1::UpdateWorkerBuildIdCompatibilityResponse>, Status> {
+        Ok(Response::new(Default::default()))
+    }
+
+    async fn get_worker_build_id_compatibility(
+        &self,
+        _request: Request<crate::temporal::api::workflowservice::v1::GetWorkerBuildIdCompatibilityRequest>,
+    ) -> Result<Response<crate::temporal::api::workflowservice::v1::GetWorkerBuildIdCompatibilityResponse>, Status> {
+        Ok(Response::new(Default::default()))
+    }
+
+    async fn update_worker_versioning_rules(
+        &self,
+        _request: Request<crate::temporal::api::workflowservice::v1::UpdateWorkerVersioningRulesRequest>,
+    ) -> Result<Response<crate::temporal::api::workflowservice::v1::UpdateWorkerVersioningRulesResponse>, Status> {
+        Ok(Response::new(Default::default()))
+    }
+
+    async fn get_worker_versioning_rules(
+        &self,
+        _request: Request<crate::temporal::api::workflowservice::v1::GetWorkerVersioningRulesRequest>,
+    ) -> Result<Response<crate::temporal::api::workflowservice::v1::GetWorkerVersioningRulesResponse>, Status> {
+        Ok(Response::new(Default::default()))
+    }
+
+    async fn get_worker_task_reachability(
+        &self,
+        _request: Request<crate::temporal::api::workflowservice::v1::GetWorkerTaskReachabilityRequest>,
+    ) -> Result<Response<crate::temporal::api::workflowservice::v1::GetWorkerTaskReachabilityResponse>, Status> {
+        Ok(Response::new(Default::default()))
+    }
+
+    async fn describe_deployment(
+        &self,
+        _request: Request<crate::temporal::api::workflowservice::v1::DescribeDeploymentRequest>,
+    ) -> Result<Response<crate::temporal::api::workflowservice::v1::DescribeDeploymentResponse>, Status> {
+        Ok(Response::new(Default::default()))
+    }
+
+    async fn describe_worker_deployment_version(
+        &self,
+        _request: Request<crate::temporal::api::workflowservice::v1::DescribeWorkerDeploymentVersionRequest>,
+    ) -> Result<Response<crate::temporal::api::workflowservice::v1::DescribeWorkerDeploymentVersionResponse>, Status> {
+        Ok(Response::new(Default::default()))
+    }
+
+    async fn list_deployments(
+        &self,
+        _request: Request<crate::temporal::api::workflowservice::v1::ListDeploymentsRequest>,
+    ) -> Result<Response<crate::temporal::api::workflowservice::v1::ListDeploymentsResponse>, Status> {
+        Ok(Response::new(Default::default()))
+    }
+
+    async fn get_deployment_reachability(
+        &self,
+        _request: Request<crate::temporal::api::workflowservice::v1::GetDeploymentReachabilityRequest>,
+    ) -> Result<Response<crate::temporal::api::workflowservice::v1::GetDeploymentReachabilityResponse>, Status> {
+        Ok(Response::new(Default::default()))
+    }
+
+    async fn get_current_deployment(
+        &self,
+        _request: Request<crate::temporal::api::workflowservice::v1::GetCurrentDeploymentRequest>,
+    ) -> Result<Response<crate::temporal::api::workflowservice::v1::GetCurrentDeploymentResponse>, Status> {
+        Ok(Response::new(Default::default()))
+    }
+
+    async fn set_current_deployment(
+        &self,
+        _request: Request<crate::temporal::api::workflowservice::v1::SetCurrentDeploymentRequest>,
+    ) -> Result<Response<crate::temporal::api::workflowservice::v1::SetCurrentDeploymentResponse>, Status> {
+        Ok(Response::new(Default::default()))
+    }
+
+    async fn set_worker_deployment_current_version(
+        &self,
+        _request: Request<crate::temporal::api::workflowservice::v1::SetWorkerDeploymentCurrentVersionRequest>,
+    ) -> Result<Response<crate::temporal::api::workflowservice::v1::SetWorkerDeploymentCurrentVersionResponse>, Status> {
+        Ok(Response::new(Default::default()))
+    }
+
+    async fn describe_worker_deployment(
+        &self,
+        _request: Request<crate::temporal::api::workflowservice::v1::DescribeWorkerDeploymentRequest>,
+    ) -> Result<Response<crate::temporal::api::workflowservice::v1::DescribeWorkerDeploymentResponse>, Status> {
+        Ok(Response::new(Default::default()))
+    }
+
+    async fn delete_worker_deployment(
+        &self,
+        _request: Request<crate::temporal::api::workflowservice::v1::DeleteWorkerDeploymentRequest>,
+    ) -> Result<Response<crate::temporal::api::workflowservice::v1::DeleteWorkerDeploymentResponse>, Status> {
+        Ok(Response::new(Default::default()))
+    }
+
+    async fn delete_worker_deployment_version(
+        &self,
+        _request: Request<crate::temporal::api::workflowservice::v1::DeleteWorkerDeploymentVersionRequest>,
+    ) -> Result<Response<crate::temporal::api::workflowservice::v1::DeleteWorkerDeploymentVersionResponse>, Status> {
+        Ok(Response::new(Default::default()))
+    }
+
+    async fn set_worker_deployment_ramping_version(
+        &self,
+        _request: Request<crate::temporal::api::workflowservice::v1::SetWorkerDeploymentRampingVersionRequest>,
+    ) -> Result<Response<crate::temporal::api::workflowservice::v1::SetWorkerDeploymentRampingVersionResponse>, Status> {
+        Ok(Response::new(Default::default()))
+    }
+
+    async fn list_worker_deployments(
+        &self,
+        _request: Request<crate::temporal::api::workflowservice::v1::ListWorkerDeploymentsRequest>,
+    ) -> Result<Response<crate::temporal::api::workflowservice::v1::ListWorkerDeploymentsResponse>, Status> {
+        Ok(Response::new(Default::default()))
+    }
+
+    async fn create_worker_deployment(
+        &self,
+        _request: Request<crate::temporal::api::workflowservice::v1::CreateWorkerDeploymentRequest>,
+    ) -> Result<Response<crate::temporal::api::workflowservice::v1::CreateWorkerDeploymentResponse>, Status> {
+        Ok(Response::new(Default::default()))
+    }
+
+    async fn create_worker_deployment_version(
+        &self,
+        _request: Request<crate::temporal::api::workflowservice::v1::CreateWorkerDeploymentVersionRequest>,
+    ) -> Result<Response<crate::temporal::api::workflowservice::v1::CreateWorkerDeploymentVersionResponse>, Status> {
+        Ok(Response::new(Default::default()))
+    }
+
+    async fn update_worker_deployment_version_compute_config(
+        &self,
+        _request: Request<crate::temporal::api::workflowservice::v1::UpdateWorkerDeploymentVersionComputeConfigRequest>,
+    ) -> Result<Response<crate::temporal::api::workflowservice::v1::UpdateWorkerDeploymentVersionComputeConfigResponse>, Status> {
+        Ok(Response::new(Default::default()))
+    }
+
+    async fn validate_worker_deployment_version_compute_config(
+        &self,
+        _request: Request<crate::temporal::api::workflowservice::v1::ValidateWorkerDeploymentVersionComputeConfigRequest>,
+    ) -> Result<Response<crate::temporal::api::workflowservice::v1::ValidateWorkerDeploymentVersionComputeConfigResponse>, Status> {
+        Ok(Response::new(Default::default()))
+    }
+
+    async fn update_worker_deployment_version_metadata(
+        &self,
+        _request: Request<crate::temporal::api::workflowservice::v1::UpdateWorkerDeploymentVersionMetadataRequest>,
+    ) -> Result<Response<crate::temporal::api::workflowservice::v1::UpdateWorkerDeploymentVersionMetadataResponse>, Status> {
+        Ok(Response::new(Default::default()))
+    }
+
+    async fn set_worker_deployment_manager(
+        &self,
+        _request: Request<crate::temporal::api::workflowservice::v1::SetWorkerDeploymentManagerRequest>,
+    ) -> Result<Response<crate::temporal::api::workflowservice::v1::SetWorkerDeploymentManagerResponse>, Status> {
+        Ok(Response::new(Default::default()))
+    }
+
+    // Workflow execution update
+    async fn update_workflow_execution(
+        &self,
+        _request: Request<crate::temporal::api::workflowservice::v1::UpdateWorkflowExecutionRequest>,
+    ) -> Result<Response<crate::temporal::api::workflowservice::v1::UpdateWorkflowExecutionResponse>, Status> {
+        Ok(Response::new(Default::default()))
+    }
+
+    async fn poll_workflow_execution_update(
+        &self,
+        _request: Request<crate::temporal::api::workflowservice::v1::PollWorkflowExecutionUpdateRequest>,
+    ) -> Result<Response<crate::temporal::api::workflowservice::v1::PollWorkflowExecutionUpdateResponse>, Status> {
+        Ok(Response::new(Default::default()))
+    }
+
+    // Batch operation
+    async fn start_batch_operation(
+        &self,
+        _request: Request<crate::temporal::api::workflowservice::v1::StartBatchOperationRequest>,
+    ) -> Result<Response<crate::temporal::api::workflowservice::v1::StartBatchOperationResponse>, Status> {
+        Ok(Response::new(Default::default()))
+    }
+
+    async fn stop_batch_operation(
+        &self,
+        _request: Request<crate::temporal::api::workflowservice::v1::StopBatchOperationRequest>,
+    ) -> Result<Response<crate::temporal::api::workflowservice::v1::StopBatchOperationResponse>, Status> {
+        Ok(Response::new(Default::default()))
+    }
+
+    async fn describe_batch_operation(
+        &self,
+        _request: Request<crate::temporal::api::workflowservice::v1::DescribeBatchOperationRequest>,
+    ) -> Result<Response<crate::temporal::api::workflowservice::v1::DescribeBatchOperationResponse>, Status> {
+        Ok(Response::new(Default::default()))
+    }
+
+    async fn list_batch_operations(
+        &self,
+        _request: Request<crate::temporal::api::workflowservice::v1::ListBatchOperationsRequest>,
+    ) -> Result<Response<crate::temporal::api::workflowservice::v1::ListBatchOperationsResponse>, Status> {
+        Ok(Response::new(Default::default()))
+    }
+
+    // Nexus
+    async fn poll_nexus_task_queue(
+        &self,
+        _request: Request<crate::temporal::api::workflowservice::v1::PollNexusTaskQueueRequest>,
+    ) -> Result<Response<crate::temporal::api::workflowservice::v1::PollNexusTaskQueueResponse>, Status> {
+        Ok(Response::new(Default::default()))
+    }
+
+    async fn respond_nexus_task_completed(
+        &self,
+        _request: Request<crate::temporal::api::workflowservice::v1::RespondNexusTaskCompletedRequest>,
+    ) -> Result<Response<crate::temporal::api::workflowservice::v1::RespondNexusTaskCompletedResponse>, Status> {
+        Ok(Response::new(Default::default()))
+    }
+
+    async fn respond_nexus_task_failed(
+        &self,
+        _request: Request<crate::temporal::api::workflowservice::v1::RespondNexusTaskFailedRequest>,
+    ) -> Result<Response<crate::temporal::api::workflowservice::v1::RespondNexusTaskFailedResponse>, Status> {
+        Ok(Response::new(Default::default()))
+    }
+
+    // Activity options
+    async fn update_activity_options(
+        &self,
+        _request: Request<crate::temporal::api::workflowservice::v1::UpdateActivityOptionsRequest>,
+    ) -> Result<Response<crate::temporal::api::workflowservice::v1::UpdateActivityOptionsResponse>, Status> {
+        Ok(Response::new(Default::default()))
+    }
+
+    async fn update_workflow_execution_options(
+        &self,
+        _request: Request<crate::temporal::api::workflowservice::v1::UpdateWorkflowExecutionOptionsRequest>,
+    ) -> Result<Response<crate::temporal::api::workflowservice::v1::UpdateWorkflowExecutionOptionsResponse>, Status> {
+        Ok(Response::new(Default::default()))
+    }
+
+    // Activity pause/unpause
+    async fn pause_activity(
+        &self,
+        _request: Request<crate::temporal::api::workflowservice::v1::PauseActivityRequest>,
+    ) -> Result<Response<crate::temporal::api::workflowservice::v1::PauseActivityResponse>, Status> {
+        Ok(Response::new(Default::default()))
+    }
+
+    async fn unpause_activity(
+        &self,
+        _request: Request<crate::temporal::api::workflowservice::v1::UnpauseActivityRequest>,
+    ) -> Result<Response<crate::temporal::api::workflowservice::v1::UnpauseActivityResponse>, Status> {
+        Ok(Response::new(Default::default()))
+    }
+
+    async fn reset_activity(
+        &self,
+        _request: Request<crate::temporal::api::workflowservice::v1::ResetActivityRequest>,
+    ) -> Result<Response<crate::temporal::api::workflowservice::v1::ResetActivityResponse>, Status> {
+        Ok(Response::new(Default::default()))
+    }
+
+    // Workflow rules
+    async fn create_workflow_rule(
+        &self,
+        _request: Request<crate::temporal::api::workflowservice::v1::CreateWorkflowRuleRequest>,
+    ) -> Result<Response<crate::temporal::api::workflowservice::v1::CreateWorkflowRuleResponse>, Status> {
+        Ok(Response::new(Default::default()))
+    }
+
+    async fn describe_workflow_rule(
+        &self,
+        _request: Request<crate::temporal::api::workflowservice::v1::DescribeWorkflowRuleRequest>,
+    ) -> Result<Response<crate::temporal::api::workflowservice::v1::DescribeWorkflowRuleResponse>, Status> {
+        Ok(Response::new(Default::default()))
+    }
+
+    async fn delete_workflow_rule(
+        &self,
+        _request: Request<crate::temporal::api::workflowservice::v1::DeleteWorkflowRuleRequest>,
+    ) -> Result<Response<crate::temporal::api::workflowservice::v1::DeleteWorkflowRuleResponse>, Status> {
+        Ok(Response::new(Default::default()))
+    }
+
+    async fn list_workflow_rules(
+        &self,
+        _request: Request<crate::temporal::api::workflowservice::v1::ListWorkflowRulesRequest>,
+    ) -> Result<Response<crate::temporal::api::workflowservice::v1::ListWorkflowRulesResponse>, Status> {
+        Ok(Response::new(Default::default()))
+    }
+
+    async fn trigger_workflow_rule(
+        &self,
+        _request: Request<crate::temporal::api::workflowservice::v1::TriggerWorkflowRuleRequest>,
+    ) -> Result<Response<crate::temporal::api::workflowservice::v1::TriggerWorkflowRuleResponse>, Status> {
+        Ok(Response::new(Default::default()))
+    }
+
+    // Worker
+    async fn record_worker_heartbeat(
+        &self,
+        _request: Request<crate::temporal::api::workflowservice::v1::RecordWorkerHeartbeatRequest>,
+    ) -> Result<Response<crate::temporal::api::workflowservice::v1::RecordWorkerHeartbeatResponse>, Status> {
+        Ok(Response::new(Default::default()))
+    }
+
+    async fn list_workers(
+        &self,
+        _request: Request<crate::temporal::api::workflowservice::v1::ListWorkersRequest>,
+    ) -> Result<Response<crate::temporal::api::workflowservice::v1::ListWorkersResponse>, Status> {
+        Ok(Response::new(Default::default()))
+    }
+
+    async fn update_task_queue_config(
+        &self,
+        _request: Request<crate::temporal::api::workflowservice::v1::UpdateTaskQueueConfigRequest>,
+    ) -> Result<Response<crate::temporal::api::workflowservice::v1::UpdateTaskQueueConfigResponse>, Status> {
+        Ok(Response::new(Default::default()))
+    }
+
+    async fn fetch_worker_config(
+        &self,
+        _request: Request<crate::temporal::api::workflowservice::v1::FetchWorkerConfigRequest>,
+    ) -> Result<Response<crate::temporal::api::workflowservice::v1::FetchWorkerConfigResponse>, Status> {
+        Ok(Response::new(Default::default()))
+    }
+
+    async fn update_worker_config(
+        &self,
+        _request: Request<crate::temporal::api::workflowservice::v1::UpdateWorkerConfigRequest>,
+    ) -> Result<Response<crate::temporal::api::workflowservice::v1::UpdateWorkerConfigResponse>, Status> {
+        Ok(Response::new(Default::default()))
+    }
+
+    async fn describe_worker(
+        &self,
+        _request: Request<crate::temporal::api::workflowservice::v1::DescribeWorkerRequest>,
+    ) -> Result<Response<crate::temporal::api::workflowservice::v1::DescribeWorkerResponse>, Status> {
+        Ok(Response::new(Default::default()))
+    }
+
+    // Workflow pause/unpause
+    async fn pause_workflow_execution(
+        &self,
+        _request: Request<crate::temporal::api::workflowservice::v1::PauseWorkflowExecutionRequest>,
+    ) -> Result<Response<crate::temporal::api::workflowservice::v1::PauseWorkflowExecutionResponse>, Status> {
+        Ok(Response::new(Default::default()))
+    }
+
+    async fn unpause_workflow_execution(
+        &self,
+        _request: Request<crate::temporal::api::workflowservice::v1::UnpauseWorkflowExecutionRequest>,
+    ) -> Result<Response<crate::temporal::api::workflowservice::v1::UnpauseWorkflowExecutionResponse>, Status> {
+        Ok(Response::new(Default::default()))
+    }
+
+    // Activity execution
+    async fn start_activity_execution(
+        &self,
+        _request: Request<crate::temporal::api::workflowservice::v1::StartActivityExecutionRequest>,
+    ) -> Result<Response<crate::temporal::api::workflowservice::v1::StartActivityExecutionResponse>, Status> {
+        Ok(Response::new(Default::default()))
+    }
+
+    // Nexus operation
+    async fn start_nexus_operation_execution(
+        &self,
+        _request: Request<crate::temporal::api::workflowservice::v1::StartNexusOperationExecutionRequest>,
+    ) -> Result<Response<crate::temporal::api::workflowservice::v1::StartNexusOperationExecutionResponse>, Status> {
+        Ok(Response::new(Default::default()))
+    }
+
+    async fn describe_activity_execution(
+        &self,
+        _request: Request<crate::temporal::api::workflowservice::v1::DescribeActivityExecutionRequest>,
+    ) -> Result<Response<crate::temporal::api::workflowservice::v1::DescribeActivityExecutionResponse>, Status> {
+        Ok(Response::new(Default::default()))
+    }
+
+    async fn describe_nexus_operation_execution(
+        &self,
+        _request: Request<crate::temporal::api::workflowservice::v1::DescribeNexusOperationExecutionRequest>,
+    ) -> Result<Response<crate::temporal::api::workflowservice::v1::DescribeNexusOperationExecutionResponse>, Status> {
+        Ok(Response::new(Default::default()))
+    }
+
+    async fn poll_activity_execution(
+        &self,
+        _request: Request<crate::temporal::api::workflowservice::v1::PollActivityExecutionRequest>,
+    ) -> Result<Response<crate::temporal::api::workflowservice::v1::PollActivityExecutionResponse>, Status> {
+        Ok(Response::new(Default::default()))
+    }
+
+    async fn poll_nexus_operation_execution(
+        &self,
+        _request: Request<crate::temporal::api::workflowservice::v1::PollNexusOperationExecutionRequest>,
+    ) -> Result<Response<crate::temporal::api::workflowservice::v1::PollNexusOperationExecutionResponse>, Status> {
+        Ok(Response::new(Default::default()))
+    }
+
+    async fn list_activity_executions(
+        &self,
+        _request: Request<crate::temporal::api::workflowservice::v1::ListActivityExecutionsRequest>,
+    ) -> Result<Response<crate::temporal::api::workflowservice::v1::ListActivityExecutionsResponse>, Status> {
+        Ok(Response::new(Default::default()))
+    }
+
+    async fn list_nexus_operation_executions(
+        &self,
+        _request: Request<crate::temporal::api::workflowservice::v1::ListNexusOperationExecutionsRequest>,
+    ) -> Result<Response<crate::temporal::api::workflowservice::v1::ListNexusOperationExecutionsResponse>, Status> {
+        Ok(Response::new(Default::default()))
+    }
+
+    async fn count_activity_executions(
+        &self,
+        _request: Request<crate::temporal::api::workflowservice::v1::CountActivityExecutionsRequest>,
+    ) -> Result<Response<crate::temporal::api::workflowservice::v1::CountActivityExecutionsResponse>, Status> {
+        Ok(Response::new(Default::default()))
+    }
+
+    async fn count_nexus_operation_executions(
+        &self,
+        _request: Request<crate::temporal::api::workflowservice::v1::CountNexusOperationExecutionsRequest>,
+    ) -> Result<Response<crate::temporal::api::workflowservice::v1::CountNexusOperationExecutionsResponse>, Status> {
+        Ok(Response::new(Default::default()))
+    }
+
+    async fn request_cancel_activity_execution(
+        &self,
+        _request: Request<crate::temporal::api::workflowservice::v1::RequestCancelActivityExecutionRequest>,
+    ) -> Result<Response<crate::temporal::api::workflowservice::v1::RequestCancelActivityExecutionResponse>, Status> {
+        Ok(Response::new(Default::default()))
+    }
+
+    async fn request_cancel_nexus_operation_execution(
+        &self,
+        _request: Request<crate::temporal::api::workflowservice::v1::RequestCancelNexusOperationExecutionRequest>,
+    ) -> Result<Response<crate::temporal::api::workflowservice::v1::RequestCancelNexusOperationExecutionResponse>, Status> {
+        Ok(Response::new(Default::default()))
+    }
+
+    async fn terminate_activity_execution(
+        &self,
+        _request: Request<crate::temporal::api::workflowservice::v1::TerminateActivityExecutionRequest>,
+    ) -> Result<Response<crate::temporal::api::workflowservice::v1::TerminateActivityExecutionResponse>, Status> {
+        Ok(Response::new(Default::default()))
+    }
+
+    async fn delete_activity_execution(
+        &self,
+        _request: Request<crate::temporal::api::workflowservice::v1::DeleteActivityExecutionRequest>,
+    ) -> Result<Response<crate::temporal::api::workflowservice::v1::DeleteActivityExecutionResponse>, Status> {
+        Ok(Response::new(Default::default()))
+    }
+
+    async fn pause_activity_execution(
+        &self,
+        _request: Request<crate::temporal::api::workflowservice::v1::PauseActivityExecutionRequest>,
+    ) -> Result<Response<crate::temporal::api::workflowservice::v1::PauseActivityExecutionResponse>, Status> {
+        Ok(Response::new(Default::default()))
+    }
+
+    async fn reset_activity_execution(
+        &self,
+        _request: Request<crate::temporal::api::workflowservice::v1::ResetActivityExecutionRequest>,
+    ) -> Result<Response<crate::temporal::api::workflowservice::v1::ResetActivityExecutionResponse>, Status> {
+        Ok(Response::new(Default::default()))
+    }
+
+    async fn unpause_activity_execution(
+        &self,
+        _request: Request<crate::temporal::api::workflowservice::v1::UnpauseActivityExecutionRequest>,
+    ) -> Result<Response<crate::temporal::api::workflowservice::v1::UnpauseActivityExecutionResponse>, Status> {
+        Ok(Response::new(Default::default()))
+    }
+
+    async fn update_activity_execution_options(
+        &self,
+        _request: Request<crate::temporal::api::workflowservice::v1::UpdateActivityExecutionOptionsRequest>,
+    ) -> Result<Response<crate::temporal::api::workflowservice::v1::UpdateActivityExecutionOptionsResponse>, Status> {
+        Ok(Response::new(Default::default()))
+    }
+
+    async fn terminate_nexus_operation_execution(
+        &self,
+        _request: Request<crate::temporal::api::workflowservice::v1::TerminateNexusOperationExecutionRequest>,
+    ) -> Result<Response<crate::temporal::api::workflowservice::v1::TerminateNexusOperationExecutionResponse>, Status> {
+        Ok(Response::new(Default::default()))
+    }
+
+    async fn delete_nexus_operation_execution(
+        &self,
+        _request: Request<crate::temporal::api::workflowservice::v1::DeleteNexusOperationExecutionRequest>,
+    ) -> Result<Response<crate::temporal::api::workflowservice::v1::DeleteNexusOperationExecutionResponse>, Status> {
+        Ok(Response::new(Default::default()))
+    }
+
+    // Worker shutdown
+    async fn shutdown_worker(
+        &self,
+        _request: Request<crate::temporal::api::workflowservice::v1::ShutdownWorkerRequest>,
+    ) -> Result<Response<crate::temporal::api::workflowservice::v1::ShutdownWorkerResponse>, Status> {
+        Ok(Response::new(Default::default()))
+    }
+
+    // Query workflow
+    async fn query_workflow(
+        &self,
+        _request: Request<crate::temporal::api::workflowservice::v1::QueryWorkflowRequest>,
+    ) -> Result<Response<crate::temporal::api::workflowservice::v1::QueryWorkflowResponse>, Status> {
+        Ok(Response::new(Default::default()))
+    }
+}
+
 // ─── Server runner ──────────────────────────────────────────────
 
 /// Start the gRPC server, spawning scheduler and engine as background tasks.
@@ -578,7 +1819,11 @@ pub async fn run_server(
 
     let schedule_svc = ScheduleServiceServer::new(state.clone());
     let workflow_svc = WorkflowServiceServer::new(state.clone());
-    let worker_svc = WorkerServiceServer::new(state);
+    let worker_svc = WorkerServiceServer::new(state.clone());
+
+    // Add Temporal WorkflowService
+    use crate::temporal::api::workflowservice::v1::workflow_service_server::WorkflowServiceServer as TemporalWorkflowServiceServer;
+    let temporal_svc = TemporalWorkflowServiceServer::new(state);
 
     tracing::info!("Starting Khronos gRPC server on {}", addr);
 
@@ -586,6 +1831,7 @@ pub async fn run_server(
         .add_service(schedule_svc)
         .add_service(workflow_svc)
         .add_service(worker_svc)
+        .add_service(temporal_svc)
         .serve(addr)
         .await?;
 

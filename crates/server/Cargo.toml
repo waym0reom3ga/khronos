@@ -12,6 +12,7 @@ khronos-core = { path = "../core" }
 khronos-db = { path = "../db" }
 tonic = "0.13"
 prost = "0.13"
+prost-types = "0.13"
 async-trait = "0.1"
 tokio = { version = "1", features = ["full"] }
 tracing = "0.1"

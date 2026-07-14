@@ -6,7 +6,7 @@ use clap::Parser;
 #[command(name = "khronos", about = "Lightweight workflow orchestration server")]
 struct Cli {
     /// Server port
-    #[arg(short, long, default_value_t = 50051)]
+    #[arg(short, long, default_value_t = 7233)]
     port: u16,
 
     /// Data directory for SQLite database
