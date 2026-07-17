@@ -10,7 +10,7 @@ path = "src/main.rs"
 [dependencies]
 khronos-core = { path = "../core" }
 khronos-db = { path = "../db" }
-tonic = "0.13"
+tonic = { version = "0.13", features = ["gzip"] }
 prost = "0.13"
 prost-types = "0.13"
 async-trait = "0.1"
