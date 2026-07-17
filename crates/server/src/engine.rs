@@ -1,43 +1,364 @@
-//! Workflow execution engine — processes workflows, retries, and heartbeat checks.
+//! Workflow execution engine — event-driven, processes workflows on demand.
 
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use chrono::Utc;
 use khronos_core::{WorkflowState};
 use khronos_db::Database;
+use tokio::sync::broadcast;
 use tracing::{debug, info, warn};
+
+/// Events that drive the engine. Sent by scheduler, gRPC API, or internal timers.
+#[derive(Debug, Clone)]
+pub enum EngineEvent {
+    /// A new workflow was inserted (by scheduler or gRPC API).
+    WorkflowCreated { run_id: String },
+    /// A workflow step finished (worker reported result).
+    StepCompleted { workflow_run_id: String },
+    /// Schedules changed (may need to re-evaluate pending workflows).
+    ScheduleChange,
+    /// Internal: retry time arrived for a specific step.
+    RetryDue { step_id: String },
+    /// Internal: heartbeat timeout arrived for a specific activity.
+    HeartbeatTimeout { activity_id: String },
+}
 
 pub struct Engine {
     db: Database,
+    events: broadcast::Receiver<EngineEvent>,
+    /// Sender shared with internal timer tasks and external producers.
+    tx: broadcast::Sender<EngineEvent>,
+}
+
+/// Global sender for engine events.
+/// Set by `Engine::new()` and accessible via `engine_sender()` for use by
+/// scheduler and gRPC handlers to notify the engine of workflow/step events.
+static ENGINE_TX: OnceLock<broadcast::Sender<EngineEvent>> = OnceLock::new();
+
+/// Get a clone of the engine event sender.
+///
+/// Call this from the scheduler or gRPC handlers to notify the engine
+/// of workflow creation, step completion, or schedule changes.
+pub fn engine_sender() -> Option<broadcast::Sender<EngineEvent>> {
+    ENGINE_TX.get().cloned()
 }
 
 impl Engine {
+    /// Create a new engine with an internal broadcast channel.
+    /// Backward-compatible constructor: creates its own event channel.
     pub fn new(db: Database) -> Self {
-        Self { db }
+        let (tx, rx) = broadcast::channel(256);
+        ENGINE_TX.set(tx.clone()).ok();
+        Self { db, events: rx, tx }
     }
 
-    /// Run the engine loop. Processes workflows every second.
-    pub async fn run(self) {
-        info!("Engine started");
-        let mut interval = tokio::time::interval(Duration::from_secs(1));
-        // Skip the first immediate tick
-        interval.tick().await;
+    /// Create an engine backed by an external broadcast sender.
+    /// The engine creates its own receiver from the sender.
+    pub fn with_channel(db: Database, tx: broadcast::Sender<EngineEvent>) -> Self {
+        let events = tx.subscribe();
+        Self { db, events, tx }
+    }
+
+    /// Get a new broadcast sender for this engine (to share with scheduler, gRPC, etc.).
+    pub fn sender(&self) -> broadcast::Sender<EngineEvent> {
+        self.tx.clone()
+    }
+
+    /// Run the event-driven engine loop. Idle when no events arrive.
+    pub async fn run(mut self) {
+        info!("Engine started (event-driven)");
 
         loop {
-            interval.tick().await;
-            if let Err(e) = self.process_workflows() {
-                warn!(error = %e, "Error processing workflows");
-            }
-            if let Err(e) = self.check_retries() {
-                warn!(error = %e, "Error checking retries");
-            }
-            if let Err(e) = self.check_heartbeats() {
-                warn!(error = %e, "Error checking heartbeats");
+            match self.events.recv().await {
+                Ok(event) => {
+                    match &event {
+                        EngineEvent::WorkflowCreated { run_id } => {
+                            info!(run_id = %run_id, "Handling WorkflowCreated");
+                            if let Err(e) = self.handle_workflow_created(run_id) {
+                                warn!(error = %e, run_id = %run_id, "Error handling WorkflowCreated");
+                            }
+                        }
+                        EngineEvent::StepCompleted { workflow_run_id } => {
+                            debug!(workflow_run_id = %workflow_run_id, "Handling StepCompleted");
+                            if let Err(e) = self.handle_step_completed(workflow_run_id) {
+                                warn!(error = %e, workflow_run_id = %workflow_run_id, "Error handling StepCompleted");
+                            }
+                        }
+                        EngineEvent::ScheduleChange => {
+                            debug!("Handling ScheduleChange");
+                            if let Err(e) = self.process_workflows() {
+                                warn!(error = %e, "Error processing workflows after schedule change");
+                            }
+                        }
+                        EngineEvent::RetryDue { step_id } => {
+                            debug!(step_id = %step_id, "Handling RetryDue");
+                            if let Err(e) = self.handle_retry_due(step_id) {
+                                warn!(error = %e, step_id = %step_id, "Error handling RetryDue");
+                            }
+                        }
+                        EngineEvent::HeartbeatTimeout { activity_id } => {
+                            warn!(activity_id = %activity_id, "Handling HeartbeatTimeout");
+                            if let Err(e) = self.handle_heartbeat_timeout(activity_id) {
+                                warn!(error = %e, activity_id = %activity_id, "Error handling HeartbeatTimeout");
+                            }
+                        }
+                    }
+                }
+                Err(broadcast::error::RecvError::Lagged(n)) => {
+                    warn!(lost_events = n, "Engine event channel lagged, recovering");
+                    // Continue — the receiver will catch up
+                }
+                Err(broadcast::error::RecvError::Closed) => {
+                    warn!("Engine event channel closed, shutting down");
+                    break;
+                }
             }
         }
+
+        info!("Engine stopped");
     }
 
+    // ─── Event handlers ─────────────────────────────────────────────
+
+    /// Handle a new workflow: transition to RUNNING, check if step 0 can start.
+    fn handle_workflow_created(&self, run_id: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let conn = self.db.connection();
+        self.process_single_workflow(&conn, run_id)?;
+        self.schedule_timers_for_workflow(&conn, run_id)?;
+        Ok(())
+    }
+
+    /// Handle a completed step: check if next step can start, check if all steps done.
+    fn handle_step_completed(&self, run_id: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let conn = self.db.connection();
+        self.process_single_workflow(&conn, run_id)?;
+        self.schedule_timers_for_workflow(&conn, run_id)?;
+        Ok(())
+    }
+
+    /// Handle a retry timer firing for a specific step.
+    fn handle_retry_due(&self, step_id: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let conn = self.db.connection();
+
+        // Verify the step is still in 'retried' state and reset to pending
+        let (state, workflow_run_id): (String, String) = conn.query_row(
+            "SELECT state, workflow_run_id FROM workflow_steps WHERE id = ?1",
+            [&step_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+
+        if state == "retried" {
+            conn.execute(
+                "UPDATE workflow_steps SET state = 'pending', next_retry_at = NULL WHERE id = ?1",
+                [&step_id],
+            )?;
+
+            debug!(step_id = %step_id, "Step reset to pending for retry");
+
+            // Now check if this workflow needs to advance
+            self.process_single_workflow(&conn, &workflow_run_id)?;
+            self.schedule_timers_for_workflow(&conn, &workflow_run_id)?;
+        }
+
+        Ok(())
+    }
+
+    /// Handle a heartbeat timeout for a specific activity.
+    fn handle_heartbeat_timeout(&self, activity_id: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let conn = self.db.connection();
+        let now = Utc::now();
+
+        // Check if the activity is still running (heartbeat may have reset it)
+        let (state, step_id): (String, String) = conn.query_row(
+            "SELECT state, step_id FROM activities WHERE id = ?1",
+            [&activity_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+
+        if state != "running" {
+            debug!(activity_id = %activity_id, "Activity no longer running, skipping heartbeat timeout");
+            return Ok(());
+        }
+
+        // Get step retry policy
+        let retry_policy_json: String = conn.query_row(
+            "SELECT retry_policy_json FROM workflow_steps WHERE id = ?1",
+            [&step_id],
+            |row| row.get(0),
+        ).unwrap_or_default();
+
+        let retry_policy: khronos_core::RetryPolicy = serde_json::from_str(&retry_policy_json).unwrap_or_default();
+        let current_attempt: u32 = conn.query_row(
+            "SELECT attempt FROM activities WHERE id = ?1",
+            [&activity_id],
+            |row| row.get(0),
+        ).unwrap_or_default();
+
+        // Mark the activity as failed
+        khronos_db::activities::update_activity_state(
+            &conn,
+            &activity_id,
+            khronos_core::ActivityState::Failed,
+            None,
+            Some("Heartbeat timeout"),
+        )?;
+
+        warn!(
+            activity_id = %activity_id,
+            step_id = %step_id,
+            "Activity heartbeat timeout exceeded"
+        );
+
+        if current_attempt < retry_policy.maximum_attempts {
+            // Schedule a retry with exponential backoff
+            let backoff_secs = retry_policy.initial_interval_secs * (2.0_f64.powi((current_attempt.saturating_sub(1)) as i32));
+            let next_retry_at = now + chrono::Duration::seconds(backoff_secs as i64);
+
+            khronos_db::activities::update_step_state(
+                &conn,
+                &step_id,
+                WorkflowState::Pending,
+                Some(current_attempt),
+                None,
+                Some(next_retry_at),
+            )?;
+
+            debug!(
+                activity_id = %activity_id,
+                step_id = %step_id,
+                attempt = current_attempt,
+                "Heartbeat timeout: scheduling retry"
+            );
+
+            // Schedule the retry timer
+            self.schedule_retry_timer(&conn, &step_id, &next_retry_at)?;
+        } else {
+            // Max retries exceeded
+            khronos_db::activities::update_step_state(
+                &conn,
+                &step_id,
+                WorkflowState::Failed,
+                Some(current_attempt),
+                None,
+                None,
+            )?;
+
+            warn!(
+                activity_id = %activity_id,
+                step_id = %step_id,
+                "Heartbeat timeout: max retries exceeded, marking as failed"
+            );
+
+            // Check if workflow should be marked failed
+            let wf_run_id: String = conn.query_row(
+                "SELECT workflow_run_id FROM workflow_steps WHERE id = ?1",
+                [&step_id],
+                |row| row.get::<_, String>(0),
+            )?;
+            self.process_single_workflow(&conn, &wf_run_id)?;
+        }
+
+        Ok(())
+    }
+
+    // ─── Timer scheduling ──────────────────────────────────────────
+
+    /// Schedule retry and heartbeat timers for all steps/activities in a workflow.
+    fn schedule_timers_for_workflow(&self, conn: &rusqlite::Connection, run_id: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        // Schedule retry timers for retried steps
+        self.schedule_retry_timers_for_workflow(conn, run_id)?;
+        // Schedule heartbeat timers for running activities
+        self.schedule_heartbeat_timers_for_workflow(conn, run_id)?;
+        Ok(())
+    }
+
+    /// Schedule tokio timers for all retried steps in a workflow.
+    fn schedule_retry_timers_for_workflow(&self, conn: &rusqlite::Connection, run_id: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let mut stmt = conn.prepare(
+            "SELECT id, next_retry_at FROM workflow_steps WHERE workflow_run_id = ?1 AND state = 'retried' AND next_retry_at IS NOT NULL",
+        )?;
+
+        let steps: Vec<(String, String)> = stmt.query_map([run_id], |row| {
+            Ok((row.get(0)?, row.get(1)?))
+        })?.filter_map(|r| r.ok()).collect();
+
+        for (step_id, next_retry_at_str) in steps {
+            if let Ok(retry_at) = chrono::DateTime::parse_from_str(&next_retry_at_str, "%Y-%m-%d %H:%M:%S")
+                .map(|dt| dt.with_timezone(&Utc)) {
+                self.schedule_retry_timer(conn, &step_id, &retry_at)?;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Schedule a single retry timer using sleep_until.
+    fn schedule_retry_timer(&self, _conn: &rusqlite::Connection, step_id: &str, retry_at: &chrono::DateTime<Utc>) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let sender = self.tx.clone();
+        let step_id = step_id.to_string();
+        let retry_deadline = tokio::time::Instant::now()
+            + retry_at.signed_duration_since(Utc::now()).to_std().unwrap_or(Duration::from_millis(1));
+
+        tokio::spawn(async move {
+            tokio::time::sleep_until(retry_deadline).await;
+            let _ = sender.send(EngineEvent::RetryDue { step_id });
+        });
+
+        Ok(())
+    }
+
+    /// Schedule heartbeat timers for all running activities in a workflow.
+    fn schedule_heartbeat_timers_for_workflow(&self, conn: &rusqlite::Connection, run_id: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        // Get running activities for this workflow
+        let mut stmt = conn.prepare(
+            "SELECT a.id, a.started_at, a.last_heartbeat_at, ws.heartbeat_timeout_secs FROM activities a JOIN workflow_steps ws ON a.step_id = ws.id WHERE a.state = 'running' AND ws.workflow_run_id = ?1",
+        )?;
+
+        let activities: Vec<(String, Option<String>, Option<String>, Option<i64>)> = stmt.query_map([run_id], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+        })?.filter_map(|r| r.ok()).collect();
+
+        for (activity_id, started_at, last_hb, timeout_secs) in activities {
+            if let Some(timeout) = timeout_secs {
+                // Reference time: last_heartbeat_at or started_at
+                let reference_time = match (last_hb.as_deref(), started_at.as_deref()) {
+                    (Some(hb), _) => chrono::DateTime::parse_from_str(hb, "%Y-%m-%d %H:%M:%S")
+                        .map(|dt| dt.with_timezone(&Utc)).ok(),
+                    (None, Some(started)) => chrono::DateTime::parse_from_str(started, "%Y-%m-%d %H:%M:%S")
+                        .map(|dt| dt.with_timezone(&Utc)).ok(),
+                    _ => continue,
+                };
+
+                if let Some(ref_time) = reference_time {
+                    let deadline = ref_time + chrono::Duration::seconds(timeout);
+                    self.schedule_heartbeat_timer(&activity_id, &deadline)?;
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Schedule a single heartbeat timer using sleep_until.
+    fn schedule_heartbeat_timer(&self, activity_id: &str, deadline: &chrono::DateTime<Utc>) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let sender = self.tx.clone();
+        let activity_id = activity_id.to_string();
+        let heartbeat_deadline = tokio::time::Instant::now()
+            + deadline.signed_duration_since(Utc::now()).to_std().unwrap_or(Duration::from_millis(1));
+
+        tokio::spawn(async move {
+            tokio::time::sleep_until(heartbeat_deadline).await;
+            let _ = sender.send(EngineEvent::HeartbeatTimeout { activity_id });
+        });
+
+        Ok(())
+    }
+
+    // ─── Legacy DB operations (kept for backward compatibility) ─────
+    #[allow(dead_code)]
     /// Process all running workflows — advance to next pending step.
+    /// Called on ScheduleChange events or for backward compatibility.
     fn process_workflows(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let conn = self.db.connection();
 
@@ -52,6 +373,7 @@ impl Engine {
 
         for (run_id, _namespace) in workflows {
             self.process_single_workflow(&conn, &run_id)?;
+            self.schedule_timers_for_workflow(&conn, &run_id)?;
         }
 
         Ok(())
@@ -135,6 +457,8 @@ impl Engine {
     }
 
     /// Check for retried steps that are ready to be re-executed.
+    /// Called for backward compatibility; event-driven path uses handle_retry_due instead.
+    #[allow(dead_code)]
     fn check_retries(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let conn = self.db.connection();
         let now_str = Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
@@ -161,6 +485,8 @@ impl Engine {
     }
 
     /// Check for running activities that have missed their heartbeat deadline.
+    /// Called for backward compatibility; event-driven path uses handle_heartbeat_timeout instead.
+    #[allow(dead_code)]
     fn check_heartbeats(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let conn = self.db.connection();
         let now = Utc::now();
@@ -257,7 +583,6 @@ impl Engine {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use khronos_core::{RetryPolicy, WorkflowStepInstance};
     use rusqlite::Connection;
     use uuid::Uuid;
 
@@ -501,5 +826,106 @@ mod tests {
 
         // No running activities — should not error
         engine.check_heartbeats().unwrap();
+    }
+
+    #[test]
+    fn test_engine_event_workflow_created() {
+        let test = test_db();
+        let conn = test.db.connection();
+
+        let run_id = Uuid::new_v4();
+        insert_workflow(&conn, run_id);
+        insert_step(&conn, run_id, 0);
+
+        let engine = Engine::new(test.db.clone());
+
+        // Directly call the handler to verify behavior
+        engine.handle_workflow_created(&run_id.to_string()).unwrap();
+
+        // Verify workflow transitioned to running
+        let state: String = conn.query_row(
+            "SELECT state FROM workflows WHERE run_id = ?1",
+            [run_id.to_string()],
+            |row| row.get(0),
+        ).unwrap();
+        assert_eq!(state, "running");
+    }
+
+    #[test]
+    fn test_engine_event_step_completed() {
+        let test = test_db();
+        let conn = test.db.connection();
+
+        let run_id = Uuid::new_v4();
+        insert_workflow(&conn, run_id);
+        let _step_id = insert_step(&conn, run_id, 0);
+
+        // Complete the step
+        conn.execute(
+            "UPDATE workflow_steps SET state = 'completed' WHERE workflow_run_id = ?1",
+            [run_id.to_string()],
+        ).unwrap();
+
+        let engine = Engine::new(test.db.clone());
+        engine.handle_step_completed(&run_id.to_string()).unwrap();
+
+        // Workflow should be marked completed
+        let state: String = conn.query_row(
+            "SELECT state FROM workflows WHERE run_id = ?1",
+            [run_id.to_string()],
+            |row| row.get(0),
+        ).unwrap();
+        assert_eq!(state, "completed");
+    }
+
+    #[test]
+    fn test_engine_event_retry_due() {
+        let test = test_db();
+        let conn = test.db.connection();
+
+        let run_id = Uuid::new_v4();
+        insert_workflow(&conn, run_id);
+        let step_id = insert_step(&conn, run_id, 0);
+
+        // Set step to 'retried'
+        conn.execute(
+            "UPDATE workflow_steps SET state = 'retried', next_retry_at = datetime('now', '-1 minute') WHERE id = ?1",
+            [step_id.to_string()],
+        ).unwrap();
+
+        let engine = Engine::new(test.db.clone());
+        engine.handle_retry_due(&step_id.to_string()).unwrap();
+
+        // Step should be reset to pending
+        let state: String = conn.query_row(
+            "SELECT state FROM workflow_steps WHERE id = ?1",
+            [step_id.to_string()],
+            |row| row.get(0),
+        ).unwrap();
+        assert_eq!(state, "pending");
+    }
+
+    #[test]
+    fn test_broadcast_channel_basic() {
+        let (tx, mut rx) = broadcast::channel::<EngineEvent>(256);
+
+        let event = EngineEvent::WorkflowCreated { run_id: "test-123".to_string() };
+        tx.send(event.clone()).unwrap();
+
+        let received = rx.try_recv().unwrap();
+        assert!(matches!(received, EngineEvent::WorkflowCreated { .. }));
+    }
+
+    #[test]
+    fn test_engine_sender_cloning() {
+        let test = test_db();
+        let engine = Engine::new(test.db);
+
+        // Should be able to get multiple senders
+        let tx1 = engine.sender();
+        let tx2 = engine.sender();
+
+        tx1.send(EngineEvent::ScheduleChange).unwrap();
+        tx2.send(EngineEvent::WorkflowCreated { run_id: "test".to_string() }).unwrap();
     }
 }

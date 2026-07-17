@@ -23,11 +23,11 @@ class KhronosClient:
 
     Args:
         host: Server hostname or IP address.
-        port: Server gRPC port (default 50051).
+        port: Server gRPC port (default 7233).
         namespace: Logical namespace for isolation (default "default").
     """
 
-    def __init__(self, host: str = "localhost", port: int = 50051, namespace: str = "default"):
+    def __init__(self, host: str = "localhost", port: int = 7233, namespace: str = "default"):
         self._host = host
         self._port = port
         self._namespace = namespace

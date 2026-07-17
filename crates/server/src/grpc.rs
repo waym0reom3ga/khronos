@@ -13,6 +13,7 @@ use khronos_db::schedules::{self as db_schedules};
 use crate::temporal::api::workflowservice::v1::workflow_service_server::WorkflowService as TemporalWorkflowService;
 use khronos_db::workflows::{self as db_workflows};
 use khronos_db::Database;
+use tokio::sync::broadcast;
 use tokio::sync::Mutex;
 
 // Re-exported proto types from the parent module (lib.rs)
@@ -22,19 +23,27 @@ use super::*;
 use crate::schedule_service_server::{ScheduleService, ScheduleServiceServer};
 use crate::workflow_service_server::{WorkflowService, WorkflowServiceServer};
 use crate::worker_service_server::{WorkerService, WorkerServiceServer};
+use tonic::codec::CompressionEncoding;
 use tonic::{Request, Response, Status};
 
 /// Shared server state.
 #[derive(Clone)]
 pub struct KhronosState {
     pub db: Arc<Mutex<Database>>,
+    pub engine_tx: Option<broadcast::Sender<super::engine::EngineEvent>>,
 }
 
 impl KhronosState {
     pub fn new(db: Database) -> Self {
         Self {
             db: Arc::new(Mutex::new(db)),
+            engine_tx: None,
         }
+    }
+
+    pub fn with_engine_tx(mut self, tx: broadcast::Sender<super::engine::EngineEvent>) -> Self {
+        self.engine_tx = Some(tx);
+        self
     }
 }
 
@@ -103,6 +112,11 @@ impl ScheduleService for KhronosState {
         db_schedules::insert_schedule(&&db.connection(), &schedule)
             .map_err(|e| Status::internal(format!("Failed to create schedule: {}", e)))?;
 
+        // Notify engine of schedule change
+        if let Some(tx) = &self.engine_tx {
+            let _ = tx.send(super::engine::EngineEvent::ScheduleChange);
+        }
+
         Ok(Response::new(CreateScheduleResponse {
             schedule_id: req.schedule_id,
         }))
@@ -141,6 +155,11 @@ impl ScheduleService for KhronosState {
         db_schedules::update_schedule_spec(&db.connection(), &req.schedule_id, &req.namespace, &updated)
             .map_err(|e| Status::internal(format!("Failed to update schedule: {}", e)))?;
 
+        // Notify engine of schedule change
+        if let Some(tx) = &self.engine_tx {
+            let _ = tx.send(super::engine::EngineEvent::ScheduleChange);
+        }
+
         Ok(Response::new(UpdateScheduleResponse { success: true }))
     }
 
@@ -152,6 +171,11 @@ impl ScheduleService for KhronosState {
         let db = self.db.lock().await;
         let rows = db_schedules::delete_schedule(&db.connection(), &req.schedule_id, &req.namespace)
             .map_err(|e| Status::internal(format!("Failed to delete schedule: {}", e)))?;
+
+        // Notify engine of schedule change
+        if let Some(tx) = &self.engine_tx {
+            let _ = tx.send(super::engine::EngineEvent::ScheduleChange);
+        }
 
         Ok(Response::new(DeleteScheduleResponse {
             success: rows > 0,
@@ -275,6 +299,13 @@ impl WorkflowService for KhronosState {
 
             db_activities::insert_workflow_step(&db.connection(), &step)
                 .map_err(|e| Status::internal(format!("Failed to create step {}: {}", index, e)))?;
+        }
+
+        // Notify engine that a new workflow was created
+        if let Some(tx) = &self.engine_tx {
+            let _ = tx.send(super::engine::EngineEvent::WorkflowCreated {
+                run_id: run_id.to_string(),
+            });
         }
 
         Ok(Response::new(StartWorkflowResponse {
@@ -458,6 +489,20 @@ impl WorkerService for KhronosState {
             Some(&result_json),
             None,
         ).map_err(|e| Status::internal(format!("Failed to update step: {}", e)))?;
+
+        // Get workflow_run_id for the engine event
+        let workflow_run_id: String = conn.query_row(
+            "SELECT workflow_run_id FROM workflow_steps WHERE id = ?1",
+            [step_id.as_str()],
+            |row| row.get(0),
+        ).map_err(|e| Status::internal(format!("Failed to find step: {}", e)))?;
+
+        // Notify engine that a step completed
+        if let Some(tx) = &self.engine_tx {
+            let _ = tx.send(super::engine::EngineEvent::StepCompleted {
+                workflow_run_id,
+            });
+        }
 
         Ok(Response::new(ReportActivityResultResponse { success: true }))
     }
@@ -754,22 +799,38 @@ impl TemporalWorkflowService for KhronosState {
                     Some(Utc::now()),
                 ).ok();
 
-                // Convert args to proto format
-                let args: Vec<crate::temporal::api::common::v1::Payload> = if let serde_json::Value::Object(map) = &step.args_json {
-                    map.iter().map(|(k, v)| {
-                        crate::temporal::api::common::v1::Payload {
-                            metadata: HashMap::new(),
-                            data: v.to_string().into_bytes(),
-                            external_payloads: vec![],
-                        }
-                    }).collect()
+                // Convert args to proto format with proper JSON encoding metadata.
+                // args_json stores the job_id as a plain string for cron_job_workflow steps.
+                let args: Vec<crate::temporal::api::common::v1::Payload> = if step.args_json.is_null()
+                    || matches!(&step.args_json, serde_json::Value::String(s) if s.is_empty()) {
+                    vec![]
+                } else if let serde_json::Value::String(job_id) = &step.args_json {
+                    // Single positional arg: job_id
+                    let mut metadata = HashMap::new();
+                    metadata.insert("encoding".to_string(), "json/plain".to_string().into_bytes());
+                    vec![crate::temporal::api::common::v1::Payload {
+                        metadata,
+                        data: serde_json::to_string(job_id).unwrap_or_else(|_| "null".to_string()).into_bytes(),
+                        external_payloads: vec![],
+                    }]
                 } else {
                     vec![]
                 };
 
+                // Look up the actual namespace from the workflow
+                let wf_namespace: String = conn.query_row(
+                    "SELECT namespace FROM workflows WHERE run_id = ?1",
+                    [&step.workflow_run_id.to_string()],
+                    |row| row.get(0),
+                ).unwrap_or_else(|_| "default".to_string());
+
                 return Ok(Response::new(crate::temporal::api::workflowservice::v1::PollActivityTaskQueueResponse {
                     task_token: activity_id.to_string().into_bytes(),
-                    workflow_namespace: step.workflow_run_id.to_string(),
+                    workflow_namespace: wf_namespace,
+                    workflow_execution: Some(crate::temporal::api::common::v1::WorkflowExecution {
+                        workflow_id: step.workflow_run_id.to_string(),
+                        run_id: step.workflow_run_id.to_string(),
+                    }),
                     activity_id: step.activity_name.clone(),
                     activity_type: Some(crate::temporal::api::common::v1::ActivityType {
                         name: step.activity_name.clone(),
@@ -946,23 +1007,88 @@ impl TemporalWorkflowService for KhronosState {
         request: Request<crate::temporal::api::workflowservice::v1::CreateScheduleRequest>,
     ) -> Result<Response<crate::temporal::api::workflowservice::v1::CreateScheduleResponse>, Status> {
         let req = request.into_inner();
-        let schedule_id = req.schedule_id;
+        let schedule_id = req.schedule_id.clone();
         let namespace = if req.namespace.is_empty() { "default".to_string() } else { req.namespace };
 
-        // Parse schedule spec from Temporal format
         let schedule = req.schedule.ok_or_else(|| Status::invalid_argument("schedule is required"))?;
+        let spec = schedule.spec.ok_or_else(|| Status::invalid_argument("schedule spec is required"))?;
+        let action = schedule.action.ok_or_else(|| Status::invalid_argument("schedule action is required"))?;
+
+        // Parse spec type and data from Temporal ScheduleSpec
+        let (spec_type, cron_expressions, interval_seconds) = if !spec.cron_string.is_empty() {
+            let cron_exprs = spec.cron_string.join(",");
+            (String::from("cron"), cron_exprs, 0)
+        } else if !spec.interval.is_empty() {
+            let secs = spec.interval.first()
+                .and_then(|iv| iv.interval)
+                .map(|d| d.seconds)
+                .unwrap_or(0);
+            (String::from("interval"), String::new(), secs)
+        } else {
+            return Err(Status::invalid_argument("schedule spec must have cron_string or interval"));
+        };
+
+        // Parse action from Temporal ScheduleAction (only start_workflow is supported)
+        let (workflow_name, task_queue, action_id, action_args_json) = match action.action {
+            Some(crate::temporal::api::schedule::v1::schedule_action::Action::StartWorkflow(sw)) => {
+                let wf_name = sw.workflow_type
+                    .map(|wt| wt.name)
+                    .unwrap_or_default();
+                let tq = sw.task_queue
+                    .map(|tq| tq.name)
+                    .unwrap_or_default();
+                let id = sw.workflow_id;
+                // Store job_id as plain string for activity arg passthrough.
+                // For lycus-cron-* schedules, extract job_id from schedule_id.
+                let args_json = if let Some(payloads) = sw.input {
+                    // Take first payload as job_id
+                    payloads.payloads.first()
+                        .map(|p| String::from_utf8_lossy(&p.data).to_string())
+                        .unwrap_or_default()
+                } else if schedule_id.starts_with("lycus-cron-") {
+                    schedule_id.strip_prefix("lycus-cron-")
+                        .unwrap_or(&schedule_id)
+                        .to_string()
+                } else {
+                    String::new()
+                };
+                (wf_name, tq, id, args_json)
+            }
+            None => {
+                return Err(Status::invalid_argument("schedule action start_workflow is required"));
+            }
+        };
+
+        // Parse overlap policy from Temporal SchedulePolicies
+        let overlap_policy = match schedule.policies.map(|p| p.overlap_policy) {
+            Some(0) | None => "skip".to_string(),
+            Some(1) => "skip".to_string(),
+            Some(2) | Some(3) => "buffer".to_string(),
+            Some(4) | Some(5) => "terminate".to_string(),
+            _ => "skip".to_string(),
+        };
 
         // Create schedule in DB
         let db = self.db.lock().await;
         let conn = db.connection();
 
-        // Insert schedule record
         conn.execute(
-            "INSERT INTO schedules (schedule_id, namespace, spec_type, spec_data, workflow_name, task_queue, created_at, updated_at) \
-             VALUES (?1, ?2, 'temporal', '', '', '', strftime('%s', 'now'), strftime('%s', 'now'))",
+            "INSERT INTO schedules (schedule_id, namespace, spec_type, cron_expressions, interval_seconds, \
+             overlap_policy, action_workflow_name, action_task_queue, action_args_json, action_id, timeouts_json, \
+             created_at, updated_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, datetime('now'), datetime('now'))",
             rusqlite::params![
                 schedule_id,
                 namespace,
+                spec_type,
+                cron_expressions,
+                interval_seconds,
+                overlap_policy,
+                workflow_name,
+                task_queue,
+                action_args_json,
+                action_id,
+                "{}",
             ],
         ).map_err(|e| Status::internal(format!("Failed to create schedule: {}", e)))?;
 
@@ -976,20 +1102,75 @@ impl TemporalWorkflowService for KhronosState {
         request: Request<crate::temporal::api::workflowservice::v1::UpdateScheduleRequest>,
     ) -> Result<Response<crate::temporal::api::workflowservice::v1::UpdateScheduleResponse>, Status> {
         let req = request.into_inner();
-        let schedule_id = req.schedule_id;
+        let schedule_id = req.schedule_id.clone();
         let namespace = if req.namespace.is_empty() { "default".to_string() } else { req.namespace };
 
+        // Verify schedule exists
         let db = self.db.lock().await;
         let conn = db.connection();
+        let exists: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM schedules WHERE schedule_id = ?1 AND namespace = ?2)",
+            rusqlite::params![schedule_id.clone(), namespace.clone()],
+            |row| row.get(0),
+        ).map_err(|e| Status::internal(format!("Failed to check schedule: {}", e)))?;
+        if !exists {
+            return Err(Status::not_found("Schedule not found"));
+        }
+
+        // Parse update input — Temporal UpdateScheduleRequest has `schedule` directly
+        let new_schedule = req.schedule.ok_or_else(|| Status::invalid_argument("schedule is required"))?;
+
+        let mut sets = Vec::new();
+        sets.push("updated_at = datetime('now')".to_string());
+
+        // Update spec if provided
+        if let Some(spec) = new_schedule.spec {
+            if !spec.cron_string.is_empty() {
+                sets.push(format!("spec_type = 'cron', cron_expressions = '{}'", spec.cron_string.join(",")));
+            } else if !spec.interval.is_empty() {
+                let secs = spec.interval.first()
+                    .and_then(|iv| iv.interval)
+                    .map(|d| d.seconds)
+                    .unwrap_or(0);
+                sets.push(format!("spec_type = 'interval', interval_seconds = {}", secs));
+            }
+        }
+
+        // Update action if provided
+        if let Some(action) = new_schedule.action {
+            if let Some(crate::temporal::api::schedule::v1::schedule_action::Action::StartWorkflow(sw)) = action.action {
+                if let Some(wt) = sw.workflow_type {
+                    sets.push(format!("action_workflow_name = '{}'", wt.name));
+                }
+                if let Some(tq) = sw.task_queue {
+                    sets.push(format!("action_task_queue = '{}'", tq.name));
+                }
+                if !sw.workflow_id.is_empty() {
+                    sets.push(format!("action_id = '{}'", sw.workflow_id));
+                }
+            }
+        }
+
+        // Update overlap policy if provided
+        if let Some(policies) = new_schedule.policies {
+            let policy = match policies.overlap_policy {
+                0 | 1 => "skip",
+                2 | 3 => "buffer",
+                 4 | 5 => "terminate",
+                _ => "skip",
+            };
+            sets.push(format!("overlap_policy = '{}'", policy));
+        }
+
+        let set_clause = sets.join(", ");
+        let sql = format!(
+            "UPDATE schedules SET {} WHERE schedule_id = ?1 AND namespace = ?2",
+            set_clause
+        );
 
         conn.execute(
-            "UPDATE schedules SET spec_data = ?1, updated_at = strftime('%s', 'now') \
-             WHERE schedule_id = ?2 AND namespace = ?3",
-            rusqlite::params![
-                "",
-                schedule_id,
-                namespace,
-            ],
+            &sql,
+            rusqlite::params![schedule_id, namespace],
         ).map_err(|e| Status::internal(format!("Failed to update schedule: {}", e)))?;
 
         Ok(Response::new(crate::temporal::api::workflowservice::v1::UpdateScheduleResponse {
@@ -1001,9 +1182,108 @@ impl TemporalWorkflowService for KhronosState {
         &self,
         request: Request<crate::temporal::api::workflowservice::v1::DescribeScheduleRequest>,
     ) -> Result<Response<crate::temporal::api::workflowservice::v1::DescribeScheduleResponse>, Status> {
-        let _req = request.into_inner();
-        // Stub for now
-        Ok(Response::new(Default::default()))
+        let req = request.into_inner();
+        let namespace = if req.namespace.is_empty() { "default".to_string() } else { req.namespace };
+
+        let db = self.db.lock().await;
+        let conn = db.connection();
+
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM schedules WHERE schedule_id = ?1 AND namespace = ?2",
+            rusqlite::params![req.schedule_id, namespace],
+            |row| row.get(0),
+        ).map_err(|e| Status::internal(format!("Failed to describe schedule: {}", e)))?;
+
+        if count == 0 {
+            return Err(Status::not_found("Schedule not found"));
+        }
+
+        let row = conn.query_row(
+            "SELECT spec_type, overlap_policy, cron_expressions, interval_seconds, \
+             action_workflow_name, action_task_queue, action_args_json, action_id, timeouts_json \
+             FROM schedules WHERE schedule_id = ?1 AND namespace = ?2",
+            rusqlite::params![req.schedule_id, namespace],
+            |row| Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, Option<i64>>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, String>(6)?,
+                row.get::<_, Option<String>>(7)?,
+                row.get::<_, Option<String>>(8)?,
+            )),
+        ).map_err(|e| Status::internal(format!("Failed to describe schedule: {}", e)));
+
+        let (spec_type, overlap_policy, cron_expressions, interval_seconds, wf_name, task_queue, _args_json, action_id, _timeouts_json) = row?;
+
+        // Build Temporal ScheduleSpec
+        let spec = if spec_type == "cron" {
+            let exprs: Vec<String> = cron_expressions
+                .and_then(|j| serde_json::from_str(&j).ok())
+                .unwrap_or_default();
+            crate::temporal::api::schedule::v1::ScheduleSpec {
+                cron_string: exprs,
+                ..Default::default()
+            }
+        } else if spec_type == "interval" {
+            let secs = interval_seconds.unwrap_or(0);
+            crate::temporal::api::schedule::v1::ScheduleSpec {
+                interval: if secs > 0 {
+                    vec![crate::temporal::api::schedule::v1::IntervalSpec {
+                        interval: Some(prost_types::Duration { seconds: secs, nanos: 0 }),
+                        ..Default::default()
+                    }]
+                } else {
+                    vec![]
+                },
+                ..Default::default()
+            }
+        } else {
+            Default::default()
+        };
+
+        // Build Temporal ScheduleAction
+        let action = crate::temporal::api::schedule::v1::schedule_action::Action::StartWorkflow(
+            crate::temporal::api::workflow::v1::NewWorkflowExecutionInfo {
+                workflow_type: Some(crate::temporal::api::common::v1::WorkflowType {
+                    name: wf_name,
+                }),
+                task_queue: Some(crate::temporal::api::taskqueue::v1::TaskQueue {
+                    name: task_queue,
+                    kind: 0,
+                    normal_name: String::new(),
+                }),
+                workflow_id: action_id.unwrap_or_default(),
+                ..Default::default()
+            }
+        );
+
+        // Build overlap policy
+        let overlap_policy_val = match overlap_policy.as_str() {
+            "skip" => 1,
+            "buffer" => 2,
+            "terminate" => 4,
+            _ => 1,
+        };
+
+        let schedule = crate::temporal::api::schedule::v1::Schedule {
+            spec: Some(spec),
+            action: Some(crate::temporal::api::schedule::v1::ScheduleAction {
+                action: Some(action),
+            }),
+            policies: Some(crate::temporal::api::schedule::v1::SchedulePolicies {
+                overlap_policy: overlap_policy_val,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        Ok(Response::new(crate::temporal::api::workflowservice::v1::DescribeScheduleResponse {
+            schedule: Some(schedule),
+            ..Default::default()
+        }))
     }
 
     async fn patch_schedule(
@@ -1803,7 +2083,11 @@ pub async fn run_server(
     addr: std::net::SocketAddr,
     db: Database,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let state = KhronosState::new(db.clone());
+    // Create engine first so we can get its sender for KhronosState
+    let engine = super::engine::Engine::new(db.clone());
+    let engine_tx = engine.sender();
+
+    let state = KhronosState::new(db.clone()).with_engine_tx(engine_tx);
 
     // Spawn scheduler as background task
     let scheduler_db = db.clone();
@@ -1812,18 +2096,21 @@ pub async fn run_server(
     });
 
     // Spawn engine as background task
-    let engine_db = db.clone();
     tokio::spawn(async move {
-        super::engine::Engine::new(engine_db).run().await;
+        engine.run().await;
     });
 
-    let schedule_svc = ScheduleServiceServer::new(state.clone());
-    let workflow_svc = WorkflowServiceServer::new(state.clone());
-    let worker_svc = WorkerServiceServer::new(state.clone());
+    let schedule_svc = ScheduleServiceServer::new(state.clone())
+        .accept_compressed(CompressionEncoding::Gzip);
+    let workflow_svc = WorkflowServiceServer::new(state.clone())
+        .accept_compressed(CompressionEncoding::Gzip);
+    let worker_svc = WorkerServiceServer::new(state.clone())
+        .accept_compressed(CompressionEncoding::Gzip);
 
     // Add Temporal WorkflowService
     use crate::temporal::api::workflowservice::v1::workflow_service_server::WorkflowServiceServer as TemporalWorkflowServiceServer;
-    let temporal_svc = TemporalWorkflowServiceServer::new(state);
+    let temporal_svc = TemporalWorkflowServiceServer::new(state)
+        .accept_compressed(CompressionEncoding::Gzip);
 
     tracing::info!("Starting Khronos gRPC server on {}", addr);
 
@@ -1842,7 +2129,15 @@ pub async fn run_server(
 
 /// Get the built-in workflow definition for a given name.
 fn get_workflow_definition(name: &str) -> Vec<khronos_core::ActivityStep> {
-    match name {
+    // Normalize: lowercase and insert underscores before capitals (camelCase → snake_case)
+    let mut normalized = String::new();
+    for (i, c) in name.chars().enumerate() {
+        if c.is_uppercase() && i > 0 {
+            normalized.push('_');
+        }
+        normalized.push(c.to_lowercase().next().unwrap_or(c));
+    }
+    match normalized.as_str() {
         "cron_job_workflow" => vec![
             khronos_core::ActivityStep {
                 activity_name: "execute_cron_job".to_string(),

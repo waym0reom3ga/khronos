@@ -17,7 +17,7 @@ JOBS = [
         "workflow_name": "lycus-arxiv-latex-factory",
         "description": "Search for new solvmanifolds papers and generate pedagogical documents",
         # Originally every 99999m (event-driven). Model as daily in Khronos.
-        "spec": ScheduleSpec(cron_expressions=["0 6 * * *"]),  # Daily at 6 AM
+        "spec": ScheduleSpec(cron_expressions=["0 0 6 * * *"]),  # Daily at 6 AM (6-field: sec min hr day mon dow)
         "args": {
             "prompt": 'Load the arxiv-latex-factory skill and execute it with subject="solvmanifolds". Search for new papers, check tracking, and generate pedagogical documents for any uncovered papers. Report what was done.',
             "skills": "arxiv-latex-factory",
@@ -33,7 +33,7 @@ JOBS = [
         "workflow_name": "lycus-mathNEXUS-pipeline",
         "description": "Extract knowledge graphs from new arXiv papers into mathNEXUS",
         # Originally every 99999m (event-driven). Model as daily, offset by 1 hour.
-        "spec": ScheduleSpec(cron_expressions=["0 7 * * *"]),  # Daily at 7 AM
+        "spec": ScheduleSpec(cron_expressions=["0 0 7 * * *"]),  # Daily at 7 AM (6-field cron)
         "args": {
             "prompt": "Run the mathNEXUS knowledge graph pipeline: check ~/Documents/AI_researched_math/arxiv_factory/ for new subdirectories, run extract_mindmap.py, merge_concept_graph.py, discovery_engine.py. Report results.",
             "toolsets": "terminal,file",
@@ -48,7 +48,7 @@ JOBS = [
         "workflow_name": "lycus-mathLaboratory-agent",
         "description": "Research agent that finds opportunities using 5 strategies",
         # Originally every 99999m (event-driven). Model as daily, offset by another hour.
-        "spec": ScheduleSpec(cron_expressions=["0 8 * * *"]),  # Daily at 8 AM
+        "spec": ScheduleSpec(cron_expressions=["0 0 8 * * *"]),  # Daily at 8 AM (6-field cron)
         "args": {
             "prompt": "Run the mathLaboratory research agent: cd ~/Documents/AI_researched_math/mathLaboratory && python laboratory_agent.py run. Report opportunities found, documents generated, and interesting research directions.",
             "toolsets": "terminal,file",
@@ -63,7 +63,7 @@ JOBS = [
         "workflow_name": "lycus-memory-condenser",
         "description": "Condense memory layers L0->L1->L2 opportunistically every 6 hours",
         # Originally every 360m = 6 hours. Cron: 0 */6 * * *
-        "spec": ScheduleSpec(cron_expressions=["0 */6 * * *"]),
+        "spec": ScheduleSpec(cron_expressions=["0 0 */6 * * *"]),  # Every 6 hours (6-field cron)
         "args": {
             "prompt": "Run the memory condensation engine opportunistically. Execute L0->L1->L2 condensation pipeline at /home/waymore/compiled/autolycus-agent/scripts/memory_condenser.py",
             "lycus_origin_id": "ccf14ac55fbe",
@@ -77,7 +77,7 @@ JOBS = [
         "workflow_name": "lycus-cron-notifier",
         "description": "Check for failed cron jobs and send alerts every 5 minutes",
         # Originally every 5m. Cron: */5 * * * *
-        "spec": ScheduleSpec(cron_expressions=["*/5 * * * *"]),
+        "spec": ScheduleSpec(cron_expressions=["*/5 * * * * *"]),  # Every 5 min (6-field cron)
         "args": {
             "script": "cron_notifier.py",
             "no_agent": "true",
@@ -92,7 +92,7 @@ JOBS = [
         "workflow_name": "lycus-searxng-healthcheck",
         "description": "Verify SearXNG works end-to-end via MCP tool every 30 minutes",
         # Originally every 30m. Cron: */30 * * * *
-        "spec": ScheduleSpec(cron_expressions=["*/30 * * * *"]),
+        "spec": ScheduleSpec(cron_expressions=["0 */30 * * * *"]),  # Every 30 min (6-field cron)
         "args": {
             "prompt": 'Run an actual SearXNG search via the MCP tool to verify it works end-to-end. Use mcp_searxng_searxng_web_search with query="test health check" and num_results=3.',
             "toolsets": "web",
@@ -107,7 +107,7 @@ JOBS = [
         "workflow_name": "lycus-searxng-error-reactive",
         "description": "Reactive check for SearXNG 429 errors every 5 minutes",
         # Originally every 5m. Cron: */5 * * * *
-        "spec": ScheduleSpec(cron_expressions=["*/5 * * * *"]),
+        "spec": ScheduleSpec(cron_expressions=["*/5 * * * * *"]),  # Every 5 min (6-field cron)
         "args": {
             "prompt": 'SearXNG 429/error reactive check. Check recent errors in ~/.autolycus/logs/errors.log for SearXNG failures and run an actual MCP search test.',
             "model": "qwen/qwen3.6-27b-mtp",
@@ -125,7 +125,7 @@ def main():
     print("Khronos Migration: Lycus Cron Jobs -> Temporal Schedules")
     print("=" * 70)
 
-    with KhronosClient('localhost', 50053) as client:
+    with KhronosClient('localhost', 7233) as client:
         # Check existing schedules first
         existing = {s.schedule_id for s in client.list_schedules()}
         print(f"\nExisting schedules on server: {len(existing)}")
