@@ -5,7 +5,7 @@
 
 ![Khronos](assets/banner.png)
 
-Khronos is a lightweight, durable workflow orchestration server written in Rust. It provides scheduled and ad-hoc workflow execution with built-in retry policies, heartbeat monitoring, overlap control, and SQLite-backed persistence — designed as the **workflow engine** in the Autolycus ecosystem alongside [TotalRecall](https://github.com/waym0reom3ga/total-recall) (memory/storage).
+Khronos is a lightweight, durable workflow orchestration server written in Rust. It provides scheduled and ad-hoc workflow execution with built-in retry policies, heartbeat monitoring, overlap control, and SQLite-backed persistence — designed as the **workflow engine** in the Autolycus ecosystem alongside [TotalRecall](https://github.com/waym0reom3ga/TotalRecall) (memory/storage).
 
 ## Architecture
 
