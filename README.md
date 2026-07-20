@@ -10,22 +10,22 @@ Khronos is a lightweight, durable workflow orchestration server written in Rust.
 ## Architecture
 
 ```
-┌─────────────────┐       gRPC        ┌──────────────────────────────────────┐
-│  Lycus Gateway  │ ◄───────────────► │          Khronos Server              │
-│  (or any client)│                   │                                      │
-└─────────────────┘                   │  ┌──────────┐  ┌──────────┐          │
-                                      │  │Scheduler │  │ Engine   │          │
-                                      │  │(cron/    │  │(workflow │          │
-                                      │  │ interval)│  │ execution│          │
-                                      │  └────┬─────┘  └────┬─────┘          │
-                                      │       │             │                │
-                                      │       ▼              ▼               │
-                                      │  ┌──────────────────────────┐        │
-                                      │  │    SQLite Database       │        │
-                                      │  │  schedules | workflows   │        │
-                                      │  │  steps     | activities  │        │
-                                      │  └──────────────────────────┘        │
-                                      └──────────────────────────────────────┘
+┌─────────────────┐       gRPC        ┌─────────────────────────────────┐
+│  Lycus Gateway  │ ◄───────────────► │         Khronos Server          │
+│  (or any client)│                   │                                 │
+└─────────────────┘                   │  ┌──────────┐  ┌──────────┐     │
+                                      │  │Scheduler │  │ Engine   │     │
+                                      │  │(cron/    │  │(workflow │     │
+                                      │  │ interval)│  │ execution│     │
+                                      │  └────┬─────┘  └────┬─────┘     │
+                                      │       │             │           │
+                                      │       ▼             ▼           │
+                                      │  ┌──────────────────────────┐   │
+                                      │  │    SQLite Database       │   │
+                                      │  │  schedules | workflows   │   │
+                                      │  │  steps     | activities  │   │
+                                      │  └──────────────────────────┘   │
+                                      └─────────────────────────────────┘
 
 Workers (Python/Rust) ◄── PollActivity / ReportResult ──► Khronos Server
 ```
