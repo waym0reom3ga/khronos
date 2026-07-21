@@ -904,6 +904,19 @@ impl TemporalWorkflowService for KhronosState {
             None,
         ).map_err(|e| Status::internal(format!("Failed to update step: {}", e)))?;
 
+        // Notify engine to check if workflow should be finalized
+        let workflow_run_id: String = conn.query_row(
+            "SELECT workflow_run_id FROM workflow_steps WHERE id = ?1",
+            [&step_id],
+            |row| row.get(0),
+        ).map_err(|e| Status::internal(format!("Failed to find workflow_run_id: {}", e)))?;
+
+        if let Some(tx) = &self.engine_tx {
+            let _ = tx.send(super::engine::EngineEvent::StepCompleted {
+                workflow_run_id,
+            });
+        }
+
         Ok(Response::new(crate::temporal::api::workflowservice::v1::RespondActivityTaskCompletedResponse {
             ..Default::default()
         }))
@@ -966,6 +979,19 @@ impl TemporalWorkflowService for KhronosState {
                 None,
                 None,
             ).map_err(|e| Status::internal(format!("Failed to mark step as failed: {}", e)))?;
+
+            // Notify engine to check if workflow should be marked failed
+            let workflow_run_id: String = conn.query_row(
+                "SELECT workflow_run_id FROM workflow_steps WHERE id = ?1",
+                [&step_id],
+                |row| row.get(0),
+            ).map_err(|e| Status::internal(format!("Failed to find workflow_run_id: {}", e)))?;
+
+            if let Some(tx) = &self.engine_tx {
+                let _ = tx.send(super::engine::EngineEvent::StepCompleted {
+                    workflow_run_id,
+                });
+            }
         }
 
         Ok(Response::new(crate::temporal::api::workflowservice::v1::RespondActivityTaskFailedResponse {
